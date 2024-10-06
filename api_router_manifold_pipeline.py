@@ -29,6 +29,8 @@ class Model(BaseModel):
     human_name: Optional[str] = Field(default=None)
     prompt_price: float  # $ per 1M tokens
     completion_price: float  # $ per 1M tokens
+    no_system_prompt: Optional[bool] = Field(default=False, description="If true, remove the system prompt. Useful for o1 models.")
+    no_stream: Optional[bool] = Field(default=False, description="If true, do not stream the response. Useful for o1 models.")
 
 
 class Provider(BaseModel):
@@ -244,6 +246,11 @@ class Pipeline:
         headers["Content-Type"] = "application/json"
 
         payload = {**body, "messages": self.remove_usage_cost_in_messages(messages), "model": model.code, "stream_options": {"include_usage": True}}
+        
+        if model.no_system_prompt:
+            payload["messages"] = [message for message in messages if message["role"] != "system"]
+        if model.no_stream:
+            payload["stream"] = False
 
         if "user" in payload:
             del payload["user"]
@@ -266,7 +273,7 @@ class Pipeline:
 
             r.raise_for_status()
 
-            if body["stream"]:
+            if payload["stream"]:
                 content = ""
                 usage = None
                 price = None
