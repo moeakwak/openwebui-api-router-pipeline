@@ -1,3 +1,13 @@
+"""
+title: API Router Manifold Pipeline
+author: Moeakwak
+date: 2024-10-12
+version: 0.1.0
+license: MIT
+description: A pipeline for routing OpenAI models, track user usages, etc.
+requirements: sqlmodel, sqlalchemy, requests, pathlib
+"""
+
 import json
 import re
 from typing import Literal, Optional, Union, Generator, Iterator
@@ -16,7 +26,7 @@ from pathlib import Path
 class Model(BaseModel):
     provider: str
     code: str
-    human_name: str
+    human_name: Optional[str] = Field(default=None)
     prompt_price: float  # $ per 1M tokens
     completion_price: float  # $ per 1M tokens
 
@@ -26,11 +36,15 @@ class Provider(BaseModel):
     format: Optional[Literal["openai"]] = Field(default="openai")
     url: str
     api_key: str
-    models: list[Model] | Literal["auto"] = Field(default="auto")  # "auto" means get models from /models endpoint
+    price_ratio: Optional[float] = Field(
+        default=1,
+        description="The price ratio of the provider. For example, if the price ratio is 0.5, then the actual cost of the provider is half of the original cost.",
+    )
 
 
-class ModelsConfig(BaseModel):
+class Config(BaseModel):
     providers: list[Provider]
+    models: list[Model]
 
 
 class OpenAICompletionUsage(BaseModel):
@@ -59,10 +73,14 @@ class UsageLog(SQLModel, table=True):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
-    price: float = Field(description="Computed price of the usage in USD.")
-    cost: float = Field(description="Actual cost of the usage in USD. 0 if not applicable.")
+    cost: float = Field(description="Computed cost of the usage.")
+    actual_cost: float = Field(description="Actual cost of the usage, after applying the price ratio of the provider.")
     content: Optional[str] = Field(default=None, description="The content of the message. Only applicable if RECORD_CONTENT is true.")
     created_at: datetime = Field(default_factory=datetime.now)
+
+
+def escape_pipeline_id(pipeline_id: str) -> str:
+    return pipeline_id.replace("/", "_")
 
 
 class Pipeline:
@@ -70,9 +88,13 @@ class Pipeline:
         MODELS_CONFIG_YAML_PATH: str = "/app/pipelines/api_router.yaml"
         DATABASE_URL: str = "sqlite:////app/pipelines/api_router.db"
         ENABLE_BILLING: bool = True
-        RECORD_CONTENT: int = Field(default=30, description="Record the first N characters of the content. Set to 0 to disable recording content.")
+        RECORD_CONTENT: int = Field(
+            default=30, description="Record the first N characters of the content. Set to 0 to disable recording content, -1 to record all content."
+        )
         DEFAULT_USER_BALANCE: float = Field(default=10, description="Default balance of the user in USD.")
         DISPLAY_COST_AFTER_MESSAGE: bool = Field(default=True, description="If true, display the cost of the usage after the message.")
+        BASE_COST_CURRENCY_UNIT: str = Field(default="$", description="The currency unit of the base cost.")
+        ACTUAL_COST_CURRENCY_UNIT: str = Field(default="$", description="The currency unit of the actual cost, also the currency unit of the user balance.")
 
     def __init__(self):
         self.type = "manifold"
@@ -81,7 +103,7 @@ class Pipeline:
         # The identifier must be unique across all pipelines.
         # The identifier must be an alphanumeric string that can include underscores or hyphens. It cannot contain spaces, special characters, slashes, or backslashes.
         self.id = "api_router"
-        self.name = "api: "
+        self.name = "💬 "
 
         self.valves = self.Valves(
             **{
@@ -91,11 +113,13 @@ class Pipeline:
                 "RECORD_CONTENT": int(os.getenv("RECORD_CONTENT", 30)),
                 "DEFAULT_USER_BALANCE": float(os.getenv("DEFAULT_USER_BALANCE", 10)),
                 "DISPLAY_COST_AFTER_MESSAGE": True if os.getenv("DISPLAY_COST_AFTER_MESSAGE", "true").lower() == "true" else False,
+                "BASE_COST_CURRENCY_UNIT": os.getenv("BASE_COST_CURRENCY_UNIT", "$"),
+                "ACTUAL_COST_CURRENCY_UNIT": os.getenv("ACTUAL_COST_CURRENCY_UNIT", "$"),
             }
         )
         self.config = self.load_config()
         self.models: dict[str, Model] = self.load_models()
-        self.pipelines = self.get_pipeline_names()
+        self.pipelines = self.get_pipelines()
         self.engine = self.setup_db()
 
     def setup_db(self) -> Engine:
@@ -118,7 +142,7 @@ class Pipeline:
         print(f"on_valves_updated:{__name__}")
         self.config = self.load_config()
         self.models = self.load_models()
-        self.pipelines = self.get_pipeline_names()
+        self.pipelines = self.get_pipelines()
         self.engine = self.setup_db()
 
     def load_config(self):
@@ -130,56 +154,29 @@ class Pipeline:
 
             with open(path, "r") as f:
                 data = yaml.load(f, Loader=yaml.FullLoader)
-            return ModelsConfig.model_validate(data)
+            return Config.model_validate(data)
         except Exception as e:
             print(f"Error loading config: {e}")
-            return ModelsConfig(providers=[])
+            return Config(providers=[])
 
     def load_models(self) -> dict[str, Model]:
         models = {}
+        provider_keys = {p.key for p in self.config.providers}
 
-        if not self.config.providers:
-            print("No providers found in config.yaml")
+        if not self.config.models:
+            print("No models found in config.yaml")
             return models
 
-        for provider in self.config.providers:
-            if isinstance(provider.models, list):
-                models.update({f"{provider.key}/{model.code}": model for model in provider.models})
-            elif provider.models == "auto":
-                try:
-                    new_models = {}
-                    headers = {}
-                    headers["Authorization"] = f"Bearer {provider.api_key}"
-                    headers["Content-Type"] = "application/json"
-
-                    r = requests.get(f"{provider.url}/models", headers=headers)
-
-                    new_models.update(
-                        {
-                            f"{provider.key}/{model['id']}": Model(
-                                provider=provider.key,
-                                code=model["id"],
-                                human_name=model["name"] if "name" in model else model["id"],
-                                prompt_price=model["prompt_price"] if "prompt_price" in model else 0,
-                                completion_price=model["completion_price"] if "completion_price" in model else 0,
-                            )
-                            for model in r.json()["data"]
-                            if model["id"].startswith(("gpt", "o1", "claude", "gemini", "llama", "mixtral"))
-                        }
-                    )
-                    print(f"Loaded {len(new_models)} models for provider {provider.key}")
-                    models.update(new_models)
-
-                except requests.exceptions.RequestException as e:
-                    print(f"Could not fetch models for provider {provider.key}. Status code: {r.status_code}, Error: {e}, Response: {r.text}")
-
-                except Exception as e:
-                    print(f"Could not fetch models for provider {provider.key}. Error: {e}")
+        for model in self.config.models:
+            if model.provider not in provider_keys:
+                print(f"Provider {model.provider} not found in config.yaml")
+                continue
+            models[escape_pipeline_id(f"{model.provider}/{model.code}")] = model
 
         return models
 
-    def get_pipeline_names(self) -> list[str]:
-        return list(self.models.keys())
+    def get_pipelines(self) -> list[dict]:
+        return [{"id": model_id, "name": model.human_name or model.code} for model_id, model in self.models.items()]
 
     def get_model_and_provider_by_id(self, model_id: str) -> Optional[tuple[Model, Provider]]:
         if not model_id:
@@ -198,45 +195,49 @@ class Pipeline:
     async def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
         print(f"inlet:{__name__}")
 
-        body["user_info"] = user  # name, id, email, role
+        if not "email" in user or not "id" in user or not "role" in user:
+            raise Exception("User info not found")
+
+        with Session(self.engine) as session:
+            db_user = session.exec(select(User).where(User.email == user["email"])).first()
+            if not db_user:
+                db_user = User(email=user["email"], openwebui_id=user["id"], role=user["role"], balance=self.valves.DEFAULT_USER_BALANCE)
+                session.add(db_user)
+                session.commit()
+            if self.valves.ENABLE_BILLING and db_user.balance <= 0 and db_user.role != "admin":
+                raise Exception("Your account has insufficient balance. Please top up your account.")
+
+        body["user_info"] = db_user.model_dump()  # name, id, email, role
 
         return body
 
     def remove_usage_cost_in_messages(self, messages: list[dict]) -> list[dict]:
         for message in messages:
             if "content" in message:
-                message["content"] = re.sub(r'\n*<span class="usage-cost-tip-ignore-this"[^>]*>.*?</span>', "", message["content"])
+                message["content"] = re.sub(r"\n*\*\(📊[^)]*\)\*$", "", message["content"], flags=re.MULTILINE)
         return messages
 
-    def generate_usage_cost_message(self, price: float, cost: float, user: User) -> str:
-        return f'\n\n<span class="usage-cost-tip-ignore-this" style="font-size: 12px; color: gray;">Price of this message: ${price:.6f}, cost: ${cost:.6f}. Remaining balance: ${user.balance - cost:.6f}</span>'
+    def generate_usage_cost_message(self, usage: OpenAICompletionUsage, base_cost: float, actual_cost: float, user: User) -> str:
+        return f"\n\n*(📊 Cost {self.valves.BASE_COST_CURRENCY_UNIT}{base_cost:.6f} | Actual Cost {self.valves.ACTUAL_COST_CURRENCY_UNIT}{actual_cost:.6f})*"
+
+    def compute_price(self, model: Model, provider: Provider, usage: OpenAICompletionUsage) -> tuple[float, float]:
+        base_cost = (usage.prompt_tokens * model.prompt_price + usage.completion_tokens * model.completion_price) / 1e6
+        actual_cost = base_cost * provider.price_ratio
+        return base_cost, actual_cost
 
     def pipe(self, user_message: str, model_id: str, messages: list[dict], body: dict) -> Union[str, Generator, Iterator]:
         # This is where you can add your custom pipelines like RAG.
         print(f"pipe:{__name__}")
 
-        print(messages)
-        print(user_message)
-
         model, provider = self.get_model_and_provider_by_id(model_id)
         if not model:
-            raise ValueError(f"Model {body.get('model')} not found")
+            raise Exception(f"Model {body.get('model')} not found")
 
         user_info = body.get("user_info")
         if not user_info:
-            raise ValueError("User info not found")
+            raise Exception("User info not found")
 
-        # create user if not exist
-        email = user_info.get("email")
-        if not email:
-            raise ValueError("Email not found")
-
-        with Session(self.engine) as session:
-            user = session.exec(select(User).where(User.email == email)).first()
-            if not user:
-                user = User(email=email, openwebui_id=user_info.get("id"), role=user_info.get("role", "user"))
-                session.add(user)
-                session.commit()
+        user = User(**user_info)
 
         headers = {}
         headers["Authorization"] = f"Bearer {provider.api_key}"
@@ -253,7 +254,7 @@ class Pipeline:
         if "title" in payload:
             del payload["title"]
 
-        print(payload)
+        print("payload:", payload)
 
         try:
             r = requests.post(
@@ -269,16 +270,26 @@ class Pipeline:
                 content = ""
                 usage = None
                 price = None
-                cost = None
                 last_chunk: dict | None = None
                 stop_chunk: dict | None = None
 
                 for line in r.iter_lines():
                     if not line:
                         continue
-                    line = line.decode("utf-8").strip("data: ")
 
-                    chunk = json.loads(line)
+                    line = line.decode("utf-8")
+                    if line == "[DONE]":
+                        yield line + "\n\n"
+                        continue
+
+                    line = line.strip("data: ")
+
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        print(f"Error decoding JSON: {line}")
+                        continue
+
                     if "choices" in chunk and len(chunk["choices"]) > 0:
                         content_delta = chunk["choices"][0].get("delta", {}).get("content", "")
                         content += content_delta
@@ -291,12 +302,11 @@ class Pipeline:
 
                     elif "usage" in chunk:
                         usage = OpenAICompletionUsage(**chunk["usage"])
-                        price = (usage.prompt_tokens * model.prompt_price + usage.completion_tokens * model.completion_price) / 1e6
-                        cost = price if user.role != "admin" else 0
+                        base_cost, actual_cost = self.compute_price(model, provider, usage)
                         if self.valves.DISPLAY_COST_AFTER_MESSAGE:
                             if last_chunk:
                                 new_chunk = last_chunk.copy()
-                                new_chunk["choices"][0]["delta"]["content"] = self.generate_usage_cost_message(price, cost, user)
+                                new_chunk["choices"][0]["delta"]["content"] = self.generate_usage_cost_message(usage, base_cost, actual_cost, user)
                                 yield "data: " + json.dumps(new_chunk) + "\n\n"
                             else:
                                 print("Error displaying usage cost: last_chunk is None")
@@ -308,43 +318,55 @@ class Pipeline:
                 if stop_chunk:
                     yield "data: " + json.dumps(stop_chunk) + "\n\n"
 
-                self.add_usage_log(user.id, model.code, usage, price, cost, content)
+                self.add_usage_log(user.id, model.code, usage, base_cost, actual_cost, content)
 
             else:
                 response = r.json()
                 usage = OpenAICompletionUsage(**response["usage"])
                 content = response["choices"][0]["message"]["content"]
 
-                price = (usage.prompt_tokens * model.prompt_price + usage.completion_tokens * model.completion_price) / 1e6
-                cost = price if user.role != "admin" else 0
-                self.add_usage_log(user.id, model.code, usage, price, cost, content)
-
-                if self.valves.DISPLAY_COST_AFTER_MESSAGE:
-                    response["choices"][0]["message"]["content"] += self.generate_usage_cost_message(price, cost, user)
+                base_cost, actual_cost = self.compute_price(model, provider, usage)
+                self.add_usage_log(user.id, model.code, usage, base_cost, actual_cost, content)
 
                 return response
 
         except Exception as e:
-            raise ValueError(f"Error: {e}")
+            raise e
 
-    def add_usage_log(self, user_id: int, model: str, usage: OpenAICompletionUsage, price: float, cost: float, content: str):
+    from sqlalchemy.exc import SQLAlchemyError
+
+    def add_usage_log(self, user_id: int, model: str, usage: OpenAICompletionUsage, base_cost: float, actual_cost: float, content: str):
         with Session(self.engine) as session:
-            usage_log = UsageLog(
-                user_id=user_id,
-                model=model,
-                prompt_tokens=usage.prompt_tokens,
-                completion_tokens=usage.completion_tokens,
-                total_tokens=usage.total_tokens,
-                price=price,
-                cost=cost,
-                content=(
-                    content[: self.valves.RECORD_CONTENT]
-                    if isinstance(self.valves.RECORD_CONTENT, int)
-                    else (content if self.valves.RECORD_CONTENT else None)
-                ),
-            )
-            session.add(usage_log)
-            session.commit()
+            try:
+                with session.begin():
+                    user = session.exec(select(User).where(User.id == user_id)).first()
+                    if not user:
+                        raise Exception("User not found")
+
+                    if self.valves.RECORD_CONTENT > 0:
+                        short_content = content[: self.valves.RECORD_CONTENT]
+                        if len(content) > len(short_content):
+                            short_content += "..."
+                        content = short_content
+                    elif self.valves.RECORD_CONTENT == 0:
+                        content = None
+
+                    usage_log = UsageLog(
+                        user_id=user.id,
+                        model=model,
+                        prompt_tokens=usage.prompt_tokens,
+                        completion_tokens=usage.completion_tokens,
+                        total_tokens=usage.total_tokens,
+                        cost=base_cost,
+                        actual_cost=actual_cost,
+                        content=content,
+                    )
+                    user.balance -= actual_cost
+                    session.add(usage_log)
+            except Exception as e:
+                print(f"An error occurred: {str(e)}")
+                session.rollback()
+                raise
 
     def handle_bot_model(self, message: str, user: User):
         pass
