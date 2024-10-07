@@ -5,7 +5,7 @@ date: 2024-10-12
 version: 0.1.0
 license: MIT
 description: A pipeline for routing OpenAI models, track user usages, etc.
-requirements: sqlmodel, sqlalchemy, requests, pathlib
+requirements: sqlmodel, sqlalchemy, requests, pathlib, tabulate
 """
 
 import json
@@ -16,9 +16,12 @@ from pydantic import BaseModel
 import requests
 from sqlalchemy import Engine, create_engine
 from sqlmodel import Field, SQLModel, Session, select
-from datetime import datetime
+from datetime import datetime, timedelta
+from tabulate import tabulate
 import yaml
 from pathlib import Path
+from sqlalchemy import func
+from typing import Optional
 
 # Schemas
 
@@ -66,6 +69,7 @@ class User(SQLModel, table=True):
     balance: float = Field(default=0, description="The balance of the user in USD. May be negative if the user has an outstanding debt.")
     role: str = Field(default="user")
     created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: datetime = Field(default_factory=datetime.now)
 
 
 class UsageLog(SQLModel, table=True):
@@ -180,7 +184,9 @@ class Pipeline:
         return models
 
     def get_pipelines(self) -> list[dict]:
-        return [{"id": model_id, "name": model.human_name or model.code} for model_id, model in self.models.items()]
+        pipelines = [{"id": model_id, "name": model.human_name or model.code} for model_id, model in self.models.items()]
+        pipelines.append({"id": "service_bot", "name": "AAA 🤖 Service Bot"})
+        return pipelines
 
     def get_model_and_provider_by_id(self, model_id: str) -> Optional[tuple[Model, Provider]]:
         if not model_id:
@@ -232,6 +238,9 @@ class Pipeline:
     def pipe(self, user_message: str, model_id: str, messages: list[dict], body: dict) -> Union[str, Generator, Iterator]:
         # This is where you can add your custom pipelines like RAG.
         # print(f"pipe:{__name__}")
+
+        if model_id == "service_bot":
+            return self.handle_bot(user_message, body["user_info"])
 
         model, provider = self.get_model_and_provider_by_id(model_id)
         if not model:
@@ -391,8 +400,6 @@ class Pipeline:
 
         return response
 
-    from sqlalchemy.exc import SQLAlchemyError
-
     def add_usage_log(self, user_id: int, model: str, usage: OpenAICompletionUsage, base_cost: float, actual_cost: float, content: str):
         with Session(self.engine) as session:
             try:
@@ -420,11 +427,216 @@ class Pipeline:
                         content=content,
                     )
                     user.balance -= actual_cost
+                    user.updated_at = datetime.now()
                     session.add(usage_log)
+                    session.commit()
             except Exception as e:
                 print(f"An error occurred: {str(e)}")
                 session.rollback()
                 raise
 
-    def handle_bot_model(self, message: str, user: User):
-        pass
+    def handle_bot(self, message: str, user: dict):
+        bot = ServiceBot(self)
+        return bot.handle_command(message, user)
+
+
+class ServiceBot:
+    def __init__(self, pipeline: Pipeline):
+        self.pipeline = pipeline
+        self.commands = {
+            "help": self.help,
+            "info": self.info,
+            "me": self.me,
+            "topup": self.topup,
+            "set_balance": self.set_balance,
+            "users": self.users,
+            "stats": self.stats,
+            "gstats": self.global_stats,
+        }
+
+    def parse_command(self, message: str) -> tuple[str, list[str]]:
+        parts = message.strip().split()
+        command = parts[0].lower()
+        args = parts[1:]
+        return command, args
+
+    def handle_command(self, message: str, user: dict) -> str:
+        command, args = self.parse_command(message)
+
+        if command not in self.commands:
+            return "Unknown command. Type 'help' for a list of available commands."
+
+        if command in ["topup", "set_balance", "users", "gstats"] and user["role"] != "admin":
+            return "You don't have permission to use this command."
+
+        return self.commands[command](args, user)
+
+    def help(self, args: list[str], user: dict) -> str:
+        help_text = """
+Available commands:
+- **help**: Show this help message
+- **info**: List all model information
+- **me**: Show your user information
+- **stats** [d/w/m]: Show your usage statistics (d: daily, w: weekly, m: monthly, default: daily)
+"""
+        if user["role"] == "admin":
+            help_text += """
+
+Admin commands:
+- **topup** [user id/email] [amount]: Top up a user's balance
+- **set_balance** [user id/email] [amount]: Set a user's balance
+- **users**: List all users
+- **gstats** [d/w/m]: Show global usage statistics (d: daily, w: weekly, m: monthly, default: daily)
+"""
+        return help_text.strip()
+
+    def info(self, args: list[str], user: dict) -> str:
+        headers = ["Model", "Prompt Price", "Completion Price", "Ratio"]
+        price_ratio_map = {}
+        for provider in self.pipeline.config.providers:
+            price_ratio_map[provider.key] = provider.price_ratio
+        data = [
+            [
+                model.human_name or model.code,
+                f"{self.pipeline.valves.BASE_COST_CURRENCY_UNIT}{model.prompt_price:.2f} / {self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{model.prompt_price * price_ratio_map[model.provider]:.2f}",
+                f"{self.pipeline.valves.BASE_COST_CURRENCY_UNIT}{model.completion_price:.2f} / {self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{model.completion_price * price_ratio_map[model.provider]:.2f}",
+                f"{price_ratio_map[model.provider] or 1:.2f}",
+            ]
+            for model in self.pipeline.models.values()
+        ]
+        return f"{tabulate(data, headers=headers, tablefmt='pipe', colalign=('left',))}"
+
+    def me(self, args: list[str], user: dict) -> str:
+        with Session(self.pipeline.engine) as session:
+            db_user = session.exec(select(User).where(User.email == user["email"])).first()
+            if not db_user:
+                return "User not found."
+            return f"""
+Your information:
+- ID: {db_user.id}
+- Email: {db_user.email}
+- Name: {db_user.name or 'N/A'}
+- Balance: {self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{db_user.balance:.2f}
+- Role: {db_user.role}
+- Created at: {db_user.created_at}
+""".strip()
+
+    def topup(self, args: list[str], user: dict) -> str:
+        if len(args) != 2:
+            return "Usage: topup [user id/email] [amount]"
+
+        user_id_or_email, amount = args
+        try:
+            amount = float(amount)
+        except ValueError:
+            return "Invalid amount. Please provide a numeric value."
+
+        with Session(self.pipeline.engine) as session:
+            db_user = session.exec(select(User).where((User.id == user_id_or_email) | (User.email == user_id_or_email))).first()
+            if not db_user:
+                return "User not found."
+            db_user.balance += amount
+            db_user.updated_at = datetime.now()  # 更新updated_at字段
+            session.commit()
+            return f"Successfully topped up {db_user.email}'s balance by ${amount:.2f}. New balance: ${db_user.balance:.2f}"
+
+    def set_balance(self, args: list[str], user: dict) -> str:
+        if len(args) != 2:
+            return "Usage: set_balance [user id/email] [amount]"
+
+        user_id_or_email, amount = args
+        try:
+            amount = float(amount)
+        except ValueError:
+            return "Invalid amount. Please provide a numeric value."
+
+        with Session(self.pipeline.engine) as session:
+            db_user = session.exec(select(User).where((User.id == user_id_or_email) | (User.email == user_id_or_email))).first()
+            if not db_user:
+                return "User not found."
+            db_user.balance = amount
+            db_user.updated_at = datetime.now()  # 更新updated_at字段
+            session.commit()
+            return f"Successfully set {db_user.email}'s balance to ${amount:.2f}"
+
+    def users(self, args: list[str], user: dict) -> str:
+        with Session(self.pipeline.engine) as session:
+            users = session.exec(select(User)).all()
+            headers = ["ID", "Name", "Email", "Balance", "Role", "Updated At", "Created At"]
+            data = [
+                [
+                    u.id,
+                    u.name or "N/A",
+                    u.email,
+                    f"{self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{u.balance:.3f}",
+                    u.role,
+                    u.updated_at,
+                    u.created_at,
+                ]
+                for u in users
+            ]
+            return f"{tabulate(data, headers=headers, tablefmt='pipe', colalign=('left',))}"
+
+    def stats(self, args: list[str], user: dict) -> str:
+        period = "d" if not args else args[0]
+        return self._get_stats(period, user["id"])
+
+    def global_stats(self, args: list[str], user: dict) -> str:
+        if user["role"] != "admin":
+            return "You don't have permission to use this command."
+        period = "d" if not args else args[0]
+        return self._get_stats(period)
+
+    def _get_stats(self, period: str, user_id: Optional[int] = None) -> str:
+        time_delta = {
+            "d": timedelta(days=1),
+            "w": timedelta(weeks=1),
+            "m": timedelta(days=30),
+        }.get(period.lower(), timedelta(days=1))
+
+        with Session(self.pipeline.engine) as session:
+            query = select(
+                UsageLog.model,
+                func.sum(UsageLog.prompt_tokens).label("total_prompt_tokens"),
+                func.sum(UsageLog.completion_tokens).label("total_completion_tokens"),
+                func.sum(UsageLog.total_tokens).label("total_tokens"),
+                func.sum(UsageLog.cost).label("total_cost"),
+                func.sum(UsageLog.actual_cost).label("total_actual_cost"),
+                func.count().label("count"),
+            ).where(UsageLog.created_at >= datetime.now() - time_delta)
+
+            if user_id:
+                query = query.where(UsageLog.user_id == user_id)
+
+            query = query.group_by(UsageLog.model)
+
+            results = session.exec(query).all()
+
+            if not results:
+                return "No usage records found for the specified time period."
+
+            headers = ["Model", "Prompt Tokens", "Completion Tokens", "Total Tokens", "Base Cost", "Actual Cost", "Usage Count"]
+            data = [
+                [
+                    r.model,
+                    r.total_prompt_tokens,
+                    r.total_completion_tokens,
+                    r.total_tokens,
+                    f"{self.pipeline.valves.BASE_COST_CURRENCY_UNIT}{r.total_cost:.4f}",
+                    f"{self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{r.total_actual_cost:.4f}",
+                    r.count,
+                ]
+                for r in results
+            ]
+
+            if not user_id:
+                unique_users = session.exec(
+                    select(func.count(func.distinct(UsageLog.user_id))).where(UsageLog.created_at >= datetime.now() - time_delta)
+                ).first()
+                headers.append("Unique Users")
+                for row in data:
+                    row.append(unique_users)
+
+            table = tabulate(data, headers=headers, tablefmt="pipe", colalign=('left',))
+            period_str = {"d": "Daily", "w": "Weekly", "m": "Monthly"}.get(period.lower(), "Daily")
+            return f"{period_str} Statistics:\n\n{table}"
