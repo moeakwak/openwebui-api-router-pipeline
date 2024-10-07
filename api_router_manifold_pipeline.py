@@ -96,7 +96,9 @@ class Pipeline:
         DEFAULT_USER_BALANCE: float = Field(default=10, description="Default balance of the user in USD.")
         DISPLAY_COST_AFTER_MESSAGE: bool = Field(default=True, description="If true, display the cost of the usage after the message.")
         BASE_COST_CURRENCY_UNIT: str = Field(default="$", description="The currency unit of the base cost.")
-        ACTUAL_COST_CURRENCY_UNIT: str = Field(default="$", description="The currency unit of the actual cost, also the currency unit of the user balance.")
+        ACTUAL_COST_CURRENCY_UNIT: str = Field(
+            default="$", description="The currency unit of the actual cost, also the currency unit of the user balance."
+        )
 
     def __init__(self):
         self.type = "manifold"
@@ -141,7 +143,7 @@ class Pipeline:
 
     async def on_valves_updated(self):
         # This function is called when the valves are updated.
-        print(f"on_valves_updated:{__name__}")
+        # print(f"on_valves_updated:{__name__}")
         self.config = self.load_config()
         self.models = self.load_models()
         self.pipelines = self.get_pipelines()
@@ -195,7 +197,7 @@ class Pipeline:
         return model, provider
 
     async def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
-        print(f"inlet:{__name__}")
+        # print(f"inlet:{__name__}")
 
         if not "email" in user or not "id" in user or not "role" in user:
             raise Exception("User info not found")
@@ -229,7 +231,7 @@ class Pipeline:
 
     def pipe(self, user_message: str, model_id: str, messages: list[dict], body: dict) -> Union[str, Generator, Iterator]:
         # This is where you can add your custom pipelines like RAG.
-        print(f"pipe:{__name__}")
+        # print(f"pipe:{__name__}")
 
         model, provider = self.get_model_and_provider_by_id(model_id)
         if not model:
@@ -246,10 +248,14 @@ class Pipeline:
         headers["Content-Type"] = "application/json"
 
         payload = {**body, "messages": self.remove_usage_cost_in_messages(messages), "model": model.code, "stream_options": {"include_usage": True}}
-        
+
+        fake_stream = False
+
         if model.no_system_prompt:
             payload["messages"] = [message for message in messages if message["role"] != "system"]
-        if model.no_stream:
+
+        if model.no_stream and body["stream"]:
+            fake_stream = True
             payload["stream"] = False
 
         if "user" in payload:
@@ -261,7 +267,7 @@ class Pipeline:
         if "title" in payload:
             del payload["title"]
 
-        print("payload:", payload)
+        # print("payload: ", payload)
 
         try:
             r = requests.post(
@@ -273,10 +279,9 @@ class Pipeline:
 
             r.raise_for_status()
 
-            if payload["stream"]:
+            if not fake_stream and body["stream"]:
                 content = ""
                 usage = None
-                price = None
                 last_chunk: dict | None = None
                 stop_chunk: dict | None = None
 
@@ -284,12 +289,11 @@ class Pipeline:
                     if not line:
                         continue
 
-                    line = line.decode("utf-8")
-                    if line == "[DONE]":
-                        yield line + "\n\n"
-                        continue
+                    line = line.decode("utf-8").strip("data: ")
 
-                    line = line.strip("data: ")
+                    if line == "[DONE]":
+                        yield "data: [DONE]\n\n"
+                        continue
 
                     try:
                         chunk = json.loads(line)
@@ -327,13 +331,49 @@ class Pipeline:
 
                 self.add_usage_log(user.id, model.code, usage, base_cost, actual_cost, content)
 
+            elif fake_stream:
+                response = r.json()
+                usage = OpenAICompletionUsage(**response["usage"])
+                content = response["choices"][0]["message"]["content"]
+                logprobs = response["choices"][0].get("logprobs", None)
+                finish_reason = response["choices"][0].get("finish_reason", None)
+
+                base_cost, actual_cost = self.compute_price(model, provider, usage)
+                self.add_usage_log(user.id, model.code, usage, base_cost, actual_cost, content)
+
+                if self.valves.DISPLAY_COST_AFTER_MESSAGE:
+                    content += self.generate_usage_cost_message(usage, base_cost, actual_cost, user)
+
+                chunk = {
+                    **response,
+                    "usage": None,
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {"content": content}, "logprobs": None, "finish_reason": None}],
+                }
+                stop_chunk = {
+                    **chunk,
+                    "choices": [{"index": 0, "delta": {}, "logprobs": logprobs, "finish_reason": finish_reason}],
+                }
+                usage_chunk = {
+                    **chunk,
+                    "choices": None,
+                    "usage": usage.model_dump(),
+                }
+
+                yield "data: " + json.dumps(chunk) + "\n\n"
+                yield "data: " + json.dumps(stop_chunk) + "\n\n"
+                yield "data: " + json.dumps(usage_chunk) + "\n\n"
+                yield "data: [DONE]"
+
             else:
                 response = r.json()
                 usage = OpenAICompletionUsage(**response["usage"])
                 content = response["choices"][0]["message"]["content"]
 
+
                 base_cost, actual_cost = self.compute_price(model, provider, usage)
                 self.add_usage_log(user.id, model.code, usage, base_cost, actual_cost, content)
+                print(f"response: {response}, type: {type(response)}")
 
                 return response
 
