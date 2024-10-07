@@ -280,105 +280,116 @@ class Pipeline:
             r.raise_for_status()
 
             if not fake_stream and body["stream"]:
-                content = ""
-                usage = None
-                last_chunk: dict | None = None
-                stop_chunk: dict | None = None
-
-                for line in r.iter_lines():
-                    if not line:
-                        continue
-
-                    line = line.decode("utf-8").strip("data: ")
-
-                    if line == "[DONE]":
-                        yield "data: [DONE]\n\n"
-                        continue
-
-                    try:
-                        chunk = json.loads(line)
-                    except json.JSONDecodeError:
-                        print(f"Error decoding JSON: {line}")
-                        continue
-
-                    if "choices" in chunk and len(chunk["choices"]) > 0:
-                        content_delta = chunk["choices"][0].get("delta", {}).get("content", "")
-                        content += content_delta
-                        # prevent displaying stop chunk
-                        if chunk.get("choices", [{}])[0].get("finish_reason") == "stop":
-                            stop_chunk = chunk
-                        else:
-                            last_chunk = chunk
-                            yield "data: " + line + "\n\n"
-
-                    elif "usage" in chunk:
-                        usage = OpenAICompletionUsage(**chunk["usage"])
-                        base_cost, actual_cost = self.compute_price(model, provider, usage)
-                        if self.valves.DISPLAY_COST_AFTER_MESSAGE:
-                            if last_chunk:
-                                new_chunk = last_chunk.copy()
-                                new_chunk["choices"][0]["delta"]["content"] = self.generate_usage_cost_message(usage, base_cost, actual_cost, user)
-                                yield "data: " + json.dumps(new_chunk) + "\n\n"
-                            else:
-                                print("Error displaying usage cost: last_chunk is None")
-                            if stop_chunk:
-                                yield "data: " + json.dumps(stop_chunk) + "\n\n"
-                                stop_chunk = None
-                        yield "data: " + line + "\n\n"
-
-                if stop_chunk:
-                    yield "data: " + json.dumps(stop_chunk) + "\n\n"
-
-                self.add_usage_log(user.id, model.code, usage, base_cost, actual_cost, content)
-
+                return self.stream_response(r, model, provider, user)
             elif fake_stream:
-                response = r.json()
-                usage = OpenAICompletionUsage(**response["usage"])
-                content = response["choices"][0]["message"]["content"]
-                logprobs = response["choices"][0].get("logprobs", None)
-                finish_reason = response["choices"][0].get("finish_reason", None)
-
-                base_cost, actual_cost = self.compute_price(model, provider, usage)
-                self.add_usage_log(user.id, model.code, usage, base_cost, actual_cost, content)
-
-                if self.valves.DISPLAY_COST_AFTER_MESSAGE:
-                    content += self.generate_usage_cost_message(usage, base_cost, actual_cost, user)
-
-                chunk = {
-                    **response,
-                    "usage": None,
-                    "object": "chat.completion.chunk",
-                    "choices": [{"index": 0, "delta": {"content": content}, "logprobs": None, "finish_reason": None}],
-                }
-                stop_chunk = {
-                    **chunk,
-                    "choices": [{"index": 0, "delta": {}, "logprobs": logprobs, "finish_reason": finish_reason}],
-                }
-                usage_chunk = {
-                    **chunk,
-                    "choices": None,
-                    "usage": usage.model_dump(),
-                }
-
-                yield "data: " + json.dumps(chunk) + "\n\n"
-                yield "data: " + json.dumps(stop_chunk) + "\n\n"
-                yield "data: " + json.dumps(usage_chunk) + "\n\n"
-                yield "data: [DONE]"
-
+                return self.fake_stream_response(r, model, provider, user)
             else:
-                response = r.json()
-                usage = OpenAICompletionUsage(**response["usage"])
-                content = response["choices"][0]["message"]["content"]
-
-
-                base_cost, actual_cost = self.compute_price(model, provider, usage)
-                self.add_usage_log(user.id, model.code, usage, base_cost, actual_cost, content)
-                print(f"response: {response}, type: {type(response)}")
-
-                return response
+                return self.non_stream_response(r, model, provider, user)
 
         except Exception as e:
             raise e
+
+    def stream_response(self, r, model, provider, user):
+        def generate():
+            content = ""
+            usage = None
+            last_chunk: dict | None = None
+            stop_chunk: dict | None = None
+
+            for line in r.iter_lines():
+                if not line:
+                    continue
+
+                line = line.decode("utf-8").strip("data: ")
+
+                if line == "[DONE]":
+                    yield "data: [DONE]\n\n"
+                    continue
+
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    print(f"Error decoding JSON: {line}")
+                    continue
+
+                if "choices" in chunk and len(chunk["choices"]) > 0:
+                    content_delta = chunk["choices"][0].get("delta", {}).get("content", "")
+                    content += content_delta
+                    # prevent displaying stop chunk
+                    if chunk.get("choices", [{}])[0].get("finish_reason") == "stop":
+                        stop_chunk = chunk
+                    else:
+                        last_chunk = chunk
+                        yield "data: " + line + "\n\n"
+
+                elif "usage" in chunk:
+                    usage = OpenAICompletionUsage(**chunk["usage"])
+                    base_cost, actual_cost = self.compute_price(model, provider, usage)
+                    if self.valves.DISPLAY_COST_AFTER_MESSAGE:
+                        if last_chunk:
+                            new_chunk = last_chunk.copy()
+                            new_chunk["choices"][0]["delta"]["content"] = self.generate_usage_cost_message(usage, base_cost, actual_cost, user)
+                            yield "data: " + json.dumps(new_chunk) + "\n\n"
+                        else:
+                            print("Error displaying usage cost: last_chunk is None")
+                        if stop_chunk:
+                            yield "data: " + json.dumps(stop_chunk) + "\n\n"
+                            stop_chunk = None
+                    yield "data: " + line + "\n\n"
+
+            if stop_chunk:
+                yield "data: " + json.dumps(stop_chunk) + "\n\n"
+
+            self.add_usage_log(user.id, model.code, usage, base_cost, actual_cost, content)
+
+        return generate()
+
+    def fake_stream_response(self, r, model, provider, user):
+        def generate():
+            response = r.json()
+            usage = OpenAICompletionUsage(**response["usage"])
+            content = response["choices"][0]["message"]["content"]
+            logprobs = response["choices"][0].get("logprobs", None)
+            finish_reason = response["choices"][0].get("finish_reason", None)
+
+            base_cost, actual_cost = self.compute_price(model, provider, usage)
+            self.add_usage_log(user.id, model.code, usage, base_cost, actual_cost, content)
+
+            if self.valves.DISPLAY_COST_AFTER_MESSAGE:
+                content += self.generate_usage_cost_message(usage, base_cost, actual_cost, user)
+
+            chunk = {
+                **response,
+                "usage": None,
+                "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {"content": content}, "logprobs": None, "finish_reason": None}],
+            }
+            stop_chunk = {
+                **chunk,
+                "choices": [{"index": 0, "delta": {}, "logprobs": logprobs, "finish_reason": finish_reason}],
+            }
+            usage_chunk = {
+                **chunk,
+                "choices": None,
+                "usage": usage.model_dump(),
+            }
+
+            yield "data: " + json.dumps(chunk) + "\n\n"
+            yield "data: " + json.dumps(stop_chunk) + "\n\n"
+            yield "data: " + json.dumps(usage_chunk) + "\n\n"
+            yield "data: [DONE]"
+
+        return generate()
+
+    def non_stream_response(self, r, model, provider, user):
+        response = r.json()
+        usage = OpenAICompletionUsage(**response["usage"])
+        content = response["choices"][0]["message"]["content"]
+
+        base_cost, actual_cost = self.compute_price(model, provider, usage)
+        self.add_usage_log(user.id, model.code, usage, base_cost, actual_cost, content)
+
+        return response
 
     from sqlalchemy.exc import SQLAlchemyError
 
