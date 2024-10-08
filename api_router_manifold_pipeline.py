@@ -8,6 +8,7 @@ description: A pipeline for routing OpenAI models, track user usages, etc.
 requirements: sqlmodel, sqlalchemy, requests, pathlib, tabulate
 """
 
+import enum
 import json
 import re
 from typing import Literal, Optional, Union, Generator, Iterator
@@ -30,8 +31,9 @@ class Model(BaseModel):
     provider: str
     code: str
     human_name: Optional[str] = Field(default=None)
-    prompt_price: float  # $ per 1M tokens
-    completion_price: float  # $ per 1M tokens
+    prompt_price: Optional[float] = Field(default=None, description="The prompt price of the model per 1M tokens.")
+    completion_price: Optional[float] = Field(default=None, description="The completion price of the model per 1M tokens.")
+    per_message_price: Optional[float] = Field(default=None, description="The price of the model per message.")
     no_system_prompt: Optional[bool] = Field(default=False, description="If true, remove the system prompt. Useful for o1 models.")
     no_stream: Optional[bool] = Field(default=False, description="If true, do not stream the response. Useful for o1 models.")
 
@@ -181,6 +183,14 @@ class Pipeline:
             if model.provider not in provider_keys:
                 print(f"Provider {model.provider} not found in config.yaml")
                 continue
+            if model.prompt_price or model.completion_price:
+                if model.prompt_price is None or model.completion_price is None:
+                    raise Exception(f"Prompt price and completion price must be set for model {model.code}")
+            elif model.per_message_price:
+                if model.per_message_price is None:
+                    raise Exception(f"Per message price must be set for model {model.code}")
+            else:
+                raise Exception(f"Model {model.code} must have either prompt price, completion price, or per message price set.")
             models[escape_pipeline_id(f"{model.provider}/{model.code}")] = model
 
         return models
@@ -223,16 +233,31 @@ class Pipeline:
     def remove_usage_cost_in_messages(self, messages: list[dict]) -> list[dict]:
         for message in messages:
             if "content" in message:
-                message["content"] = re.sub(r"\n*\*\(📊[^)]*\)\*$", "", message["content"], flags=re.MULTILINE)
+                if isinstance(message["content"], str):
+                    message["content"] = re.sub(r"\n*\*\(📊[^)]*\)\*$", "", message["content"], flags=re.MULTILINE)
+                elif isinstance(message["content"], list):
+                    for content in message["content"]:
+                        if isinstance(content, dict) and "text" in content:
+                            content["text"] = re.sub(r"\n*\*\(📊[^)]*\)\*$", "", content["text"], flags=re.MULTILINE)
+            else:
+                print(f"Unknown message type: {message}")
         return messages
 
     def generate_usage_cost_message(self, usage: OpenAICompletionUsage, base_cost: float, actual_cost: float, user: User) -> str:
+        if base_cost == 0 and actual_cost == 0:
+            return "\n\n*(📊 This is a free message)*"
         return f"\n\n*(📊 Cost {self.valves.ACTUAL_COST_CURRENCY_UNIT}{actual_cost:.6f} | {self.valves.BASE_COST_CURRENCY_UNIT}{base_cost:.6f})*"
 
-    def compute_price(self, model: Model, provider: Provider, usage: OpenAICompletionUsage) -> tuple[float, float]:
-        base_cost = (usage.prompt_tokens * model.prompt_price + usage.completion_tokens * model.completion_price) / 1e6
-        actual_cost = base_cost * provider.price_ratio
-        return base_cost, actual_cost
+    def compute_price(self, model: Model, provider: Provider, usage: Optional[OpenAICompletionUsage] = None) -> tuple[float, float]:
+        if usage and model.prompt_price and model.completion_price:
+            base_cost = (usage.prompt_tokens * model.prompt_price + usage.completion_tokens * model.completion_price) / 1e6
+            actual_cost = base_cost * provider.price_ratio
+            return base_cost, actual_cost
+        elif model.per_message_price:
+            return model.per_message_price, model.per_message_price * provider.price_ratio
+        else:
+            print(f"Warning: Model {model.code} has no pricing information")
+            return 0, 0
 
     def pipe(self, user_message: str, model_id: str, messages: list[dict], body: dict) -> Union[str, Generator, Iterator]:
         # This is where you can add your custom pipelines like RAG.
@@ -275,8 +300,6 @@ class Pipeline:
         if "title" in payload:
             del payload["title"]
 
-        # print("payload: ", payload)
-
         try:
             r = requests.post(
                 url=f"{provider.url}/chat/completions",
@@ -305,6 +328,7 @@ class Pipeline:
             usage = None
             last_chunk: dict | None = None
             stop_chunk: dict | None = None
+            usage_chunk: dict | None = None
 
             for line in r.iter_lines():
                 if not line:
@@ -313,8 +337,7 @@ class Pipeline:
                 line = line.decode("utf-8").strip("data: ")
 
                 if line == "[DONE]":
-                    yield "data: [DONE]\n\n"
-                    continue
+                    break
 
                 try:
                     chunk = json.loads(line)
@@ -334,21 +357,24 @@ class Pipeline:
 
                 elif "usage" in chunk:
                     usage = OpenAICompletionUsage(**chunk["usage"])
-                    base_cost, actual_cost = self.compute_price(model, provider, usage)
-                    if self.valves.DISPLAY_COST_AFTER_MESSAGE:
-                        if last_chunk:
-                            new_chunk = last_chunk.copy()
-                            new_chunk["choices"][0]["delta"]["content"] = self.generate_usage_cost_message(usage, base_cost, actual_cost, user)
-                            yield "data: " + json.dumps(new_chunk) + "\n\n"
-                        else:
-                            print("Error displaying usage cost: last_chunk is None")
-                        if stop_chunk:
-                            yield "data: " + json.dumps(stop_chunk) + "\n\n"
-                            stop_chunk = None
-                    yield "data: " + line + "\n\n"
+                    usage_chunk = chunk
 
+            base_cost, actual_cost = self.compute_price(model, provider, usage)
+
+            if self.valves.DISPLAY_COST_AFTER_MESSAGE:
+                if last_chunk:
+                    new_chunk = last_chunk.copy()
+                    new_chunk["choices"][0]["delta"]["content"] = self.generate_usage_cost_message(usage, base_cost, actual_cost, user)
+                    yield "data: " + json.dumps(new_chunk) + "\n\n"
+                else:
+                    print("Error displaying usage cost: last_chunk is None")
             if stop_chunk:
                 yield "data: " + json.dumps(stop_chunk) + "\n\n"
+                stop_chunk = None
+            if usage_chunk:
+                yield "data: " + json.dumps(usage_chunk) + "\n\n"
+                usage_chunk = None
+            yield "data: [DONE]"
 
             self.add_usage_log(
                 user.id, model.code, usage, base_cost, actual_cost, content, is_stream=is_stream, is_title_generation=is_title_generation
@@ -361,7 +387,7 @@ class Pipeline:
     ):
         def generate():
             response = r.json()
-            usage = OpenAICompletionUsage(**response["usage"])
+            usage = OpenAICompletionUsage(**response["usage"]) if "usage" in response else None
             content = response["choices"][0]["message"]["content"]
             logprobs = response["choices"][0].get("logprobs", None)
             finish_reason = response["choices"][0].get("finish_reason", None)
@@ -401,7 +427,7 @@ class Pipeline:
         self, r: requests.Response, model: Model, provider: Provider, user: User, is_title_generation: bool = False, is_stream: bool = True
     ):
         response = r.json()
-        usage = OpenAICompletionUsage(**response["usage"])
+        usage = OpenAICompletionUsage(**response["usage"]) if "usage" in response else None
         content = response["choices"][0]["message"]["content"]
 
         base_cost, actual_cost = self.compute_price(model, provider, usage)
@@ -413,7 +439,7 @@ class Pipeline:
         self,
         user_id: int,
         model: str,
-        usage: OpenAICompletionUsage,
+        usage: Optional[OpenAICompletionUsage],
         base_cost: float,
         actual_cost: float,
         content: str,
@@ -438,9 +464,9 @@ class Pipeline:
                     usage_log = UsageLog(
                         user_id=user.id,
                         model=model,
-                        prompt_tokens=usage.prompt_tokens,
-                        completion_tokens=usage.completion_tokens,
-                        total_tokens=usage.total_tokens,
+                        prompt_tokens=usage.prompt_tokens if usage else 0,
+                        completion_tokens=usage.completion_tokens if usage else 0,
+                        total_tokens=usage.total_tokens if usage else 0,
                         cost=base_cost,
                         actual_cost=actual_cost,
                         content=content,
@@ -516,16 +542,23 @@ Admin commands:
         return help_text.strip()
 
     def info(self, args: list[str], user: dict) -> str:
-        headers = ["Model", "Prompt Price", "Completion Price", "Ratio"]
+        headers = [
+            "Model",
+            f"Prompt ({self.pipeline.valves.BASE_COST_CURRENCY_UNIT} per 1M)",
+            f"Completion ({self.pipeline.valves.BASE_COST_CURRENCY_UNIT} per 1M)",
+            f"Per Message ({self.pipeline.valves.BASE_COST_CURRENCY_UNIT})",
+            "Ratio",
+        ]
         price_ratio_map = {}
         for provider in self.pipeline.config.providers:
             price_ratio_map[provider.key] = provider.price_ratio
         data = [
             [
                 model.human_name or model.code,
-                f"{self.pipeline.valves.BASE_COST_CURRENCY_UNIT}{model.prompt_price:.2f} / {self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{model.prompt_price * price_ratio_map[model.provider]:.2f}",
-                f"{self.pipeline.valves.BASE_COST_CURRENCY_UNIT}{model.completion_price:.2f} / {self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{model.completion_price * price_ratio_map[model.provider]:.2f}",
-                f"{price_ratio_map[model.provider] or 1:.2f}",
+                model.prompt_price or "-",
+                model.completion_price or "-",
+                model.per_message_price or "-",
+                price_ratio_map[model.provider] or "-",
             ]
             for model in self.pipeline.models.values()
         ]
