@@ -68,21 +68,23 @@ class User(SQLModel, table=True):
     name: Optional[str] = Field(default=None)
     balance: float = Field(default=0, description="The balance of the user in USD. May be negative if the user has an outstanding debt.")
     role: str = Field(default="user")
-    created_at: datetime = Field(default_factory=datetime.now)
-    updated_at: datetime = Field(default_factory=datetime.now)
+    created_at: datetime = Field(default_factory=datetime.now, index=True)
+    updated_at: datetime = Field(default_factory=datetime.now, index=True)
 
 
 class UsageLog(SQLModel, table=True):
     id: int = Field(default=None, primary_key=True)
     user_id: int = Field(foreign_key="user.id")
-    model: str
+    model: str = Field(index=True)
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    is_stream: bool = Field(default=True, description="If true, the usage is a stream.")
+    is_title_generation: bool = Field(default=False, index=True, description="If true, the usage is a title generation.")
     cost: float = Field(description="Computed cost of the usage.")
     actual_cost: float = Field(description="Actual cost of the usage, after applying the price ratio of the provider.")
     content: Optional[str] = Field(default=None, description="The content of the message. Only applicable if RECORD_CONTENT is true.")
-    created_at: datetime = Field(default_factory=datetime.now)
+    created_at: datetime = Field(default_factory=datetime.now, index=True)
 
 
 def escape_pipeline_id(pipeline_id: str) -> str:
@@ -188,17 +190,14 @@ class Pipeline:
         pipelines.append({"id": "service_bot", "name": "AAA 🤖 Service Bot"})
         return pipelines
 
-    def get_model_and_provider_by_id(self, model_id: str) -> Optional[tuple[Model, Provider]]:
-        if not model_id:
-            return None
-
+    def get_model_and_provider_by_id(self, model_id: str) -> tuple[Model, Provider]:
         model = self.models.get(model_id)
         if not model:
-            return None
+            raise Exception(f"Model {model_id} not found")
 
         provider = next((p for p in self.config.providers if p.key == model.provider), None)
         if not provider:
-            return None
+            raise Exception(f"Provider {model.provider} not found in config.yaml")
 
         return model, provider
 
@@ -228,7 +227,7 @@ class Pipeline:
         return messages
 
     def generate_usage_cost_message(self, usage: OpenAICompletionUsage, base_cost: float, actual_cost: float, user: User) -> str:
-        return f"\n\n*(📊 Cost {self.valves.BASE_COST_CURRENCY_UNIT}{base_cost:.6f} | Actual Cost {self.valves.ACTUAL_COST_CURRENCY_UNIT}{actual_cost:.6f})*"
+        return f"\n\n*(📊 Cost {self.valves.ACTUAL_COST_CURRENCY_UNIT}{actual_cost:.6f} | {self.valves.BASE_COST_CURRENCY_UNIT}{base_cost:.6f})*"
 
     def compute_price(self, model: Model, provider: Provider, usage: OpenAICompletionUsage) -> tuple[float, float]:
         base_cost = (usage.prompt_tokens * model.prompt_price + usage.completion_tokens * model.completion_price) / 1e6
@@ -243,8 +242,6 @@ class Pipeline:
             return self.handle_bot(user_message, body["user_info"])
 
         model, provider = self.get_model_and_provider_by_id(model_id)
-        if not model:
-            raise Exception(f"Model {body.get('model')} not found")
 
         user_info = body.get("user_info")
         if not user_info:
@@ -257,6 +254,8 @@ class Pipeline:
         headers["Content-Type"] = "application/json"
 
         payload = {**body, "messages": self.remove_usage_cost_in_messages(messages), "model": model.code, "stream_options": {"include_usage": True}}
+
+        extra = {"is_title_generation": "RESPOND ONLY WITH THE TITLE" in user_message, "is_stream": body.get("stream")}
 
         fake_stream = False
 
@@ -289,16 +288,18 @@ class Pipeline:
             r.raise_for_status()
 
             if not fake_stream and body["stream"]:
-                return self.stream_response(r, model, provider, user)
+                return self.stream_response(r, model, provider, user, **extra)
             elif fake_stream:
-                return self.fake_stream_response(r, model, provider, user)
+                return self.fake_stream_response(r, model, provider, user, **extra)
             else:
-                return self.non_stream_response(r, model, provider, user)
+                return self.non_stream_response(r, model, provider, user, **extra)
 
         except Exception as e:
             raise e
 
-    def stream_response(self, r, model, provider, user):
+    def stream_response(
+        self, r: requests.Response, model: Model, provider: Provider, user: User, is_title_generation: bool = False, is_stream: bool = True
+    ):
         def generate():
             content = ""
             usage = None
@@ -349,11 +350,15 @@ class Pipeline:
             if stop_chunk:
                 yield "data: " + json.dumps(stop_chunk) + "\n\n"
 
-            self.add_usage_log(user.id, model.code, usage, base_cost, actual_cost, content)
+            self.add_usage_log(
+                user.id, model.code, usage, base_cost, actual_cost, content, is_stream=is_stream, is_title_generation=is_title_generation
+            )
 
         return generate()
 
-    def fake_stream_response(self, r, model, provider, user):
+    def fake_stream_response(
+        self, r: requests.Response, model: Model, provider: Provider, user: User, is_title_generation: bool = False, is_stream: bool = True
+    ):
         def generate():
             response = r.json()
             usage = OpenAICompletionUsage(**response["usage"])
@@ -362,7 +367,9 @@ class Pipeline:
             finish_reason = response["choices"][0].get("finish_reason", None)
 
             base_cost, actual_cost = self.compute_price(model, provider, usage)
-            self.add_usage_log(user.id, model.code, usage, base_cost, actual_cost, content)
+            self.add_usage_log(
+                user.id, model.code, usage, base_cost, actual_cost, content, is_stream=is_stream, is_title_generation=is_title_generation
+            )
 
             if self.valves.DISPLAY_COST_AFTER_MESSAGE:
                 content += self.generate_usage_cost_message(usage, base_cost, actual_cost, user)
@@ -390,17 +397,29 @@ class Pipeline:
 
         return generate()
 
-    def non_stream_response(self, r, model, provider, user):
+    def non_stream_response(
+        self, r: requests.Response, model: Model, provider: Provider, user: User, is_title_generation: bool = False, is_stream: bool = True
+    ):
         response = r.json()
         usage = OpenAICompletionUsage(**response["usage"])
         content = response["choices"][0]["message"]["content"]
 
         base_cost, actual_cost = self.compute_price(model, provider, usage)
-        self.add_usage_log(user.id, model.code, usage, base_cost, actual_cost, content)
+        self.add_usage_log(user.id, model.code, usage, base_cost, actual_cost, content, is_stream=is_stream, is_title_generation=is_title_generation)
 
         return response
 
-    def add_usage_log(self, user_id: int, model: str, usage: OpenAICompletionUsage, base_cost: float, actual_cost: float, content: str):
+    def add_usage_log(
+        self,
+        user_id: int,
+        model: str,
+        usage: OpenAICompletionUsage,
+        base_cost: float,
+        actual_cost: float,
+        content: str,
+        is_stream: bool = True,
+        is_title_generation: bool = False,
+    ):
         with Session(self.engine) as session:
             try:
                 with session.begin():
@@ -425,6 +444,8 @@ class Pipeline:
                         cost=base_cost,
                         actual_cost=actual_cost,
                         content=content,
+                        is_stream=is_stream,
+                        is_title_generation=is_title_generation,
                     )
                     user.balance -= actual_cost
                     user.updated_at = datetime.now()
@@ -451,7 +472,9 @@ class ServiceBot:
             "set_balance": self.set_balance,
             "users": self.users,
             "stats": self.stats,
-            "gstats": self.global_stats,
+            "gstats": self.gstats,
+            "recent": self.recent,
+            "grecent": self.grecent,
         }
 
     def parse_command(self, message: str) -> tuple[str, list[str]]:
@@ -466,7 +489,7 @@ class ServiceBot:
         if command not in self.commands:
             return "Unknown command. Type 'help' for a list of available commands."
 
-        if command in ["topup", "set_balance", "users", "gstats"] and user["role"] != "admin":
+        if command in ["topup", "set_balance", "users", "gstats", "grecent"] and user["role"] != "admin":
             return "You don't have permission to use this command."
 
         return self.commands[command](args, user)
@@ -478,6 +501,7 @@ Available commands:
 - **info**: List all model information
 - **me**: Show your user information
 - **stats** [d/w/m]: Show your usage statistics (d: daily, w: weekly, m: monthly, default: daily)
+- **recent** [count]: Show your recent usage logs (default count: 20)
 """
         if user["role"] == "admin":
             help_text += """
@@ -487,6 +511,7 @@ Admin commands:
 - **set_balance** [user id/email] [amount]: Set a user's balance
 - **users**: List all users
 - **gstats** [d/w/m]: Show global usage statistics (d: daily, w: weekly, m: monthly, default: daily)
+- **grecent** [count]: Show global recent usage logs (default count: 100)
 """
         return help_text.strip()
 
@@ -516,7 +541,7 @@ Your information:
 - ID: {db_user.id}
 - Email: {db_user.email}
 - Name: {db_user.name or 'N/A'}
-- Balance: {self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{db_user.balance:.2f}
+- Balance: {self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{db_user.balance:.6f}
 - Role: {db_user.role}
 - Created at: {db_user.created_at}
 """.strip()
@@ -581,7 +606,7 @@ Your information:
         period = "d" if not args else args[0]
         return self._get_stats(period, user["id"])
 
-    def global_stats(self, args: list[str], user: dict) -> str:
+    def gstats(self, args: list[str], user: dict) -> str:
         if user["role"] != "admin":
             return "You don't have permission to use this command."
         period = "d" if not args else args[0]
@@ -622,8 +647,8 @@ Your information:
                     r.total_prompt_tokens,
                     r.total_completion_tokens,
                     r.total_tokens,
-                    f"{self.pipeline.valves.BASE_COST_CURRENCY_UNIT}{r.total_cost:.4f}",
-                    f"{self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{r.total_actual_cost:.4f}",
+                    f"{self.pipeline.valves.BASE_COST_CURRENCY_UNIT}{r.total_cost:.6f}",
+                    f"{self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{r.total_actual_cost:.6f}",
                     r.count,
                 ]
                 for r in results
@@ -637,6 +662,55 @@ Your information:
                 for row in data:
                     row.append(unique_users)
 
-            table = tabulate(data, headers=headers, tablefmt="pipe", colalign=('left',))
+            table = tabulate(data, headers=headers, tablefmt="pipe", colalign=("left",))
             period_str = {"d": "Daily", "w": "Weekly", "m": "Monthly"}.get(period.lower(), "Daily")
             return f"{period_str} Statistics:\n\n{table}"
+
+    def recent(self, args: list[str], user: dict) -> str:
+        count = 20
+        if args and args[0].isdigit():
+            count = int(args[0])
+        return self._get_recent_logs(user["id"], count)
+
+    def grecent(self, args: list[str], user: dict) -> str:
+        if user["role"] != "admin":
+            return "You don't have permission to use this command."
+        count = 100
+        if args and args[0].isdigit():
+            count = int(args[0])
+        return self._get_recent_logs(None, count)
+
+    def _get_recent_logs(self, user_id: Optional[int], count: int, show_title_generation: bool = False) -> str:
+        with Session(self.pipeline.engine) as session:
+            query = select(UsageLog, User.name, User.id).join(User, UsageLog.user_id == User.id)
+            if not show_title_generation:
+                query = query.where(UsageLog.is_title_generation == False)
+            if user_id:
+                query = query.where(UsageLog.user_id == user_id)
+            query = query.order_by(UsageLog.created_at.desc()).limit(count)
+
+            results = session.exec(query).all()
+
+            if not results:
+                return "No recent usage logs found."
+
+            headers = ["Time", "Model", "Tokens", "Cost", "Content", "Is Stream"]
+            if not user_id:
+                headers.insert(1, "User")
+
+            data = []
+            for r in results:
+                row = [
+                    r.UsageLog.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    r.UsageLog.model,
+                    r.UsageLog.total_tokens,
+                    f"{self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{r.UsageLog.actual_cost:.6f}",
+                    (r.UsageLog.content[:10] + "...") if r.UsageLog.content and len(r.UsageLog.content) > 10 else (r.UsageLog.content or "N/A"),
+                    r.UsageLog.is_stream,
+                ]
+                if not user_id:
+                    row.insert(1, f"{r.name or 'N/A'} (ID: {r.id})")
+                data.append(row)
+
+            table = tabulate(data, headers=headers, tablefmt="pipe", colalign=("left",))
+            return f"Recent Usage Logs:\n\n{table}"
