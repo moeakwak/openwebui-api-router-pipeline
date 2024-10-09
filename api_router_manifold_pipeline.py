@@ -220,7 +220,7 @@ class Pipeline:
         with Session(self.engine) as session:
             db_user = session.exec(select(User).where(User.email == user["email"])).first()
             if not db_user:
-                db_user = User(email=user["email"], openwebui_id=user["id"], role=user["role"], balance=self.valves.DEFAULT_USER_BALANCE)
+                db_user = User(name=user.get("name"), email=user["email"], openwebui_id=user["id"], role=user["role"], balance=self.valves.DEFAULT_USER_BALANCE)
                 session.add(db_user)
                 session.commit()
             if self.valves.ENABLE_BILLING and db_user.balance <= 0 and db_user.role != "admin":
@@ -733,12 +733,17 @@ Your information:
 
             data = []
             for r in results:
+                content = r.UsageLog.content[:10] if r.UsageLog.content else "-"
+                if len(r.UsageLog.content) > 10:
+                    content += "..."
+                content = content.replace("\n", "\\n")
+                content = content.replace("\r", "\\r")
                 row = [
                     r.UsageLog.created_at.strftime("%Y-%m-%d %H:%M:%S"),
                     r.UsageLog.model,
                     r.UsageLog.total_tokens,
                     f"{self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{r.UsageLog.actual_cost:.6f}",
-                    (r.UsageLog.content[:10] + "...") if r.UsageLog.content and len(r.UsageLog.content) > 10 else (r.UsageLog.content or "N/A"),
+                    content,
                     r.UsageLog.is_stream,
                 ]
                 if not user_id:
