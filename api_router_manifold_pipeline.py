@@ -36,6 +36,10 @@ class Model(BaseModel):
     per_message_price: Optional[float] = Field(default=None, description="The price of the model per message.")
     no_system_prompt: Optional[bool] = Field(default=False, description="If true, remove the system prompt. Useful for o1 models.")
     no_stream: Optional[bool] = Field(default=False, description="If true, do not stream the response. Useful for o1 models.")
+    fetch_usage_by_api: Optional[bool] = Field(
+        default=False, description="If true, fetch usage from the /generation endpoint, for example, OpenRouter. Only works with stream=true"
+    )
+    extra_args: Optional[dict] = Field(default=None, description="Extra arguments to pass to the model. Will override the original values.")
 
 
 class Provider(BaseModel):
@@ -220,7 +224,9 @@ class Pipeline:
         with Session(self.engine) as session:
             db_user = session.exec(select(User).where(User.email == user["email"])).first()
             if not db_user:
-                db_user = User(name=user.get("name"), email=user["email"], openwebui_id=user["id"], role=user["role"], balance=self.valves.DEFAULT_USER_BALANCE)
+                db_user = User(
+                    name=user.get("name"), email=user["email"], openwebui_id=user["id"], role=user["role"], balance=self.valves.DEFAULT_USER_BALANCE
+                )
                 session.add(db_user)
                 session.commit()
             if self.valves.ENABLE_BILLING and db_user.balance <= 0 and db_user.role != "admin":
@@ -280,7 +286,10 @@ class Pipeline:
 
         payload = {**body, "messages": self.remove_usage_cost_in_messages(messages), "model": model.code, "stream_options": {"include_usage": True}}
 
-        extra = {"is_title_generation": "RESPOND ONLY WITH THE TITLE" in user_message, "is_stream": body.get("stream")}
+        if model.extra_args:
+            payload = {**payload, **model.extra_args}
+
+        args = {"is_title_generation": "RESPOND ONLY WITH THE TITLE" in user_message, "is_stream": body.get("stream")}
 
         fake_stream = False
 
@@ -311,14 +320,32 @@ class Pipeline:
             r.raise_for_status()
 
             if not fake_stream and body["stream"]:
-                return self.stream_response(r, model, provider, user, **extra)
+                return self.stream_response(r, model, provider, user, **args)
             elif fake_stream:
-                return self.fake_stream_response(r, model, provider, user, **extra)
+                return self.fake_stream_response(r, model, provider, user, **args)
             else:
-                return self.non_stream_response(r, model, provider, user, **extra)
+                return self.non_stream_response(r, model, provider, user, **args)
 
         except Exception as e:
             raise e
+
+    def fetch_usage_by_api(self, message_id: str, provider: Provider) -> OpenAICompletionUsage:
+        headers = {
+            "Authorization": f"Bearer {provider.api_key}",
+            "Content-Type": "application/json",
+        }
+        generation_response = requests.get(f"{provider.url}/generation", params={"id": message_id}, headers=headers)
+        if generation_response.status_code == 200:
+            data = generation_response.json().get("data", {})
+            prompt_tokens = data.get("native_tokens_prompt", 0)
+            completion_tokens = data.get("native_tokens_completion", 0)
+            total_tokens = prompt_tokens + completion_tokens
+            total_cost = data.get("total_cost", 0)
+            usage = OpenAICompletionUsage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, total_tokens=total_tokens)
+            return usage, total_cost
+        else:
+            print(f"Failed to fetch usage by API: {generation_response.status_code} {generation_response.text}")
+            return None, 0
 
     def stream_response(
         self, r: requests.Response, model: Model, provider: Provider, user: User, is_title_generation: bool = False, is_stream: bool = True
@@ -329,12 +356,16 @@ class Pipeline:
             last_chunk: dict | None = None
             stop_chunk: dict | None = None
             usage_chunk: dict | None = None
+            message_id: str | None = None
 
             for line in r.iter_lines():
                 if not line:
                     continue
 
-                line = line.decode("utf-8").strip("data: ")
+                line = line.decode("utf-8")
+                if line.startswith(":"):
+                    continue
+                line = line.strip("data: ")
 
                 if line == "[DONE]":
                     break
@@ -353,11 +384,15 @@ class Pipeline:
                         stop_chunk = chunk
                     else:
                         last_chunk = chunk
+                        message_id = chunk.get("id") if message_id is None else message_id
                         yield "data: " + line + "\n\n"
 
                 elif "usage" in chunk:
                     usage = OpenAICompletionUsage(**chunk["usage"])
                     usage_chunk = chunk
+
+            if model.fetch_usage_by_api and message_id:
+                usage, _ = self.fetch_usage_by_api(message_id, provider)
 
             base_cost, actual_cost = self.compute_price(model, provider, usage)
 
@@ -391,6 +426,10 @@ class Pipeline:
             content = response["choices"][0]["message"]["content"]
             logprobs = response["choices"][0].get("logprobs", None)
             finish_reason = response["choices"][0].get("finish_reason", None)
+            message_id = response.get("id")
+
+            if model.fetch_usage_by_api and message_id:
+                usage, _ = self.fetch_usage_by_api(message_id, provider)
 
             base_cost, actual_cost = self.compute_price(model, provider, usage)
             self.add_usage_log(
@@ -429,9 +468,16 @@ class Pipeline:
         response = r.json()
         usage = OpenAICompletionUsage(**response["usage"]) if "usage" in response else None
         content = response["choices"][0]["message"]["content"]
+        message_id = response.get("id")
+
+        if model.fetch_usage_by_api and message_id:
+            usage, _ = self.fetch_usage_by_api(message_id, provider)
 
         base_cost, actual_cost = self.compute_price(model, provider, usage)
         self.add_usage_log(user.id, model.code, usage, base_cost, actual_cost, content, is_stream=is_stream, is_title_generation=is_title_generation)
+
+        if self.valves.DISPLAY_COST_AFTER_MESSAGE and not is_title_generation:
+            content += self.generate_usage_cost_message(usage, base_cost, actual_cost, user)
 
         return response
 
