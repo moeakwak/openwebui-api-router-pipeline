@@ -14,6 +14,7 @@ import re
 from typing import Literal, Optional, Union, Generator, Iterator
 import os
 from pydantic import BaseModel
+import pytz
 import requests
 from sqlalchemy import Engine, create_engine
 from sqlmodel import Field, SQLModel, Session, select
@@ -89,7 +90,7 @@ class UsageLog(SQLModel, table=True):
     is_title_generation: bool = Field(default=False, index=True, description="If true, the usage is a title generation.")
     cost: float = Field(description="Computed cost of the usage.")
     actual_cost: float = Field(description="Actual cost of the usage, after applying the price ratio of the provider.")
-    content: Optional[str] = Field(default=None, description="The content of the message. Only applicable if RECORD_CONTENT is true.")
+    content: Optional[str] = Field(default=None, description="The content of the prompt. Only applicable if RECORD_CONTENT is true.")
     created_at: datetime = Field(default_factory=datetime.now, index=True)
 
 
@@ -111,6 +112,7 @@ class Pipeline:
         ACTUAL_COST_CURRENCY_UNIT: str = Field(
             default="$", description="The currency unit of the actual cost, also the currency unit of the user balance."
         )
+        TIMEZONE: str = Field(default="UTC", description="The timezone of the server.")
 
     def __init__(self):
         self.type = "manifold"
@@ -131,6 +133,7 @@ class Pipeline:
                 "DISPLAY_COST_AFTER_MESSAGE": True if os.getenv("DISPLAY_COST_AFTER_MESSAGE", "true").lower() == "true" else False,
                 "BASE_COST_CURRENCY_UNIT": os.getenv("BASE_COST_CURRENCY_UNIT", "$"),
                 "ACTUAL_COST_CURRENCY_UNIT": os.getenv("ACTUAL_COST_CURRENCY_UNIT", "$"),
+                "TIMEZONE": os.getenv("TIMEZONE", "UTC"),
             }
         )
         self.config = self.load_config()
@@ -229,6 +232,10 @@ class Pipeline:
                 )
                 session.add(db_user)
                 session.commit()
+            if db_user.name != user.get("name"):
+                db_user.name = user.get("name")
+                session.add(db_user)
+                session.commit()
             if self.valves.ENABLE_BILLING and db_user.balance <= 0 and db_user.role != "admin":
                 raise Exception("Your account has insufficient balance. Please top up your account.")
 
@@ -320,11 +327,11 @@ class Pipeline:
             r.raise_for_status()
 
             if not fake_stream and body["stream"]:
-                return self.stream_response(r, model, provider, user, **args)
+                return self.stream_response(r, model, provider, user, user_message, **args)
             elif fake_stream:
-                return self.fake_stream_response(r, model, provider, user, **args)
+                return self.fake_stream_response(r, model, provider, user, user_message, **args)
             else:
-                return self.non_stream_response(r, model, provider, user, **args)
+                return self.non_stream_response(r, model, provider, user, user_message, **args)
 
         except Exception as e:
             raise e
@@ -348,7 +355,14 @@ class Pipeline:
             return None, 0
 
     def stream_response(
-        self, r: requests.Response, model: Model, provider: Provider, user: User, is_title_generation: bool = False, is_stream: bool = True
+        self,
+        r: requests.Response,
+        model: Model,
+        provider: Provider,
+        user: User,
+        user_message: str,
+        is_title_generation: bool = False,
+        is_stream: bool = True,
     ):
         def generate():
             content = ""
@@ -412,13 +426,20 @@ class Pipeline:
             yield "data: [DONE]"
 
             self.add_usage_log(
-                user.id, model.code, usage, base_cost, actual_cost, content, is_stream=is_stream, is_title_generation=is_title_generation
+                user.id, model.code, usage, base_cost, actual_cost, content=user_message, is_stream=is_stream, is_title_generation=is_title_generation
             )
 
         return generate()
 
     def fake_stream_response(
-        self, r: requests.Response, model: Model, provider: Provider, user: User, is_title_generation: bool = False, is_stream: bool = True
+        self,
+        r: requests.Response,
+        model: Model,
+        provider: Provider,
+        user: User,
+        user_message: str,
+        is_title_generation: bool = False,
+        is_stream: bool = True,
     ):
         def generate():
             response = r.json()
@@ -433,9 +454,8 @@ class Pipeline:
 
             base_cost, actual_cost = self.compute_price(model, provider, usage)
             self.add_usage_log(
-                user.id, model.code, usage, base_cost, actual_cost, content, is_stream=is_stream, is_title_generation=is_title_generation
+                user.id, model.code, usage, base_cost, actual_cost, content=user_message, is_stream=is_stream, is_title_generation=is_title_generation
             )
-
             if self.valves.DISPLAY_COST_AFTER_MESSAGE:
                 content += self.generate_usage_cost_message(usage, base_cost, actual_cost, user)
 
@@ -463,7 +483,14 @@ class Pipeline:
         return generate()
 
     def non_stream_response(
-        self, r: requests.Response, model: Model, provider: Provider, user: User, is_title_generation: bool = False, is_stream: bool = True
+        self,
+        r: requests.Response,
+        model: Model,
+        provider: Provider,
+        user: User,
+        user_message: str,
+        is_title_generation: bool = False,
+        is_stream: bool = True,
     ):
         response = r.json()
         usage = OpenAICompletionUsage(**response["usage"]) if "usage" in response else None
@@ -474,7 +501,9 @@ class Pipeline:
             usage, _ = self.fetch_usage_by_api(message_id, provider)
 
         base_cost, actual_cost = self.compute_price(model, provider, usage)
-        self.add_usage_log(user.id, model.code, usage, base_cost, actual_cost, content, is_stream=is_stream, is_title_generation=is_title_generation)
+        self.add_usage_log(
+            user.id, model.code, usage, base_cost, actual_cost, content=user_message, is_stream=is_stream, is_title_generation=is_title_generation
+        )
 
         if self.valves.DISPLAY_COST_AFTER_MESSAGE and not is_title_generation:
             content += self.generate_usage_cost_message(usage, base_cost, actual_cost, user)
@@ -573,7 +602,7 @@ Available commands:
 - **info**: List all model information
 - **me**: Show your user information
 - **stats** [d/w/m]: Show your usage statistics (d: daily, w: weekly, m: monthly, default: daily)
-- **recent** [count]: Show your recent usage logs (default count: 20)
+- **recent** [count] [page]: Show your recent usage logs (default count: 20, default page: 0)
 """
         if user["role"] == "admin":
             help_text += """
@@ -583,31 +612,49 @@ Admin commands:
 - **set_balance** [user id/email] [amount]: Set a user's balance
 - **users**: List all users
 - **gstats** [d/w/m]: Show global usage statistics (d: daily, w: weekly, m: monthly, default: daily)
-- **grecent** [count]: Show global recent usage logs (default count: 100)
+- **grecent** [count] [page]: Show global recent usage logs (default count: 50, default page: 0)
 """
         return help_text.strip()
 
     def info(self, args: list[str], user: dict) -> str:
-        headers = [
-            "Model",
-            f"Prompt ({self.pipeline.valves.BASE_COST_CURRENCY_UNIT} per 1M)",
-            f"Completion ({self.pipeline.valves.BASE_COST_CURRENCY_UNIT} per 1M)",
-            f"Per Message ({self.pipeline.valves.BASE_COST_CURRENCY_UNIT})",
-            "Ratio",
-        ]
         price_ratio_map = {}
         for provider in self.pipeline.config.providers:
             price_ratio_map[provider.key] = provider.price_ratio
-        data = [
-            [
-                model.human_name or model.code,
-                model.prompt_price or "-",
-                model.completion_price or "-",
-                model.per_message_price or "-",
-                price_ratio_map[model.provider] or "-",
-            ]
-            for model in self.pipeline.models.values()
+            
+        headers = [
+            "Model",
+            f"Prompt (per 1M)",
+            f"Completion (per 1M)",
+            f"Per Message",
+            "Ratio",
         ]
+        data = []
+
+        for model in self.pipeline.models.values():
+            prompt_price = model.prompt_price or 0
+            completion_price = model.completion_price or 0
+            per_message_price = model.per_message_price or 0
+            price_ratio = price_ratio_map[model.provider] or 1
+
+            base_cost_currency_unit = self.pipeline.valves.BASE_COST_CURRENCY_UNIT
+            actual_cost_currency_unit = self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT
+            actual_prompt_price = prompt_price * price_ratio
+            actual_completion_price = completion_price * price_ratio
+            actual_per_message_price = per_message_price * price_ratio
+
+            prompt_price_text = f"{actual_cost_currency_unit}{actual_prompt_price:.2f} ({base_cost_currency_unit}{prompt_price:.2f})" if prompt_price > 0 else "-"
+            completion_price_text = f"{actual_cost_currency_unit}{actual_completion_price:.2f} ({base_cost_currency_unit}{completion_price:.2f})" if completion_price > 0 else "-"
+            per_message_price_text = f"{actual_cost_currency_unit}{actual_per_message_price:.2f} ({base_cost_currency_unit}{per_message_price:.2f})" if per_message_price > 0 else "-"
+
+            data.append(
+                [
+                    model.human_name or model.code,
+                    prompt_price_text,
+                    completion_price_text,
+                    per_message_price_text,
+                    price_ratio_map[model.provider] or "-",
+                ]
+            )
         return f"{tabulate(data, headers=headers, tablefmt='pipe', colalign=('left',))}"
 
     def me(self, args: list[str], user: dict) -> str:
@@ -642,7 +689,7 @@ Your information:
             db_user.balance += amount
             db_user.updated_at = datetime.now()  # 更新updated_at字段
             session.commit()
-            return f"Successfully topped up {db_user.email}'s balance by ${amount:.2f}. New balance: ${db_user.balance:.2f}"
+            return f"Successfully topped up {db_user.email}'s balance by {self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{amount:.2f}. New balance: {self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{db_user.balance:.2f}"
 
     def set_balance(self, args: list[str], user: dict) -> str:
         if len(args) != 2:
@@ -674,8 +721,8 @@ Your information:
                     u.email,
                     f"{self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{u.balance:.3f}",
                     u.role,
-                    u.updated_at,
-                    u.created_at,
+                    u.updated_at.astimezone(pytz.timezone(self.pipeline.valves.TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S"),
+                    u.created_at.astimezone(pytz.timezone(self.pipeline.valves.TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S"),
                 ]
                 for u in users
             ]
@@ -747,45 +794,53 @@ Your information:
 
     def recent(self, args: list[str], user: dict) -> str:
         count = 20
-        if args and args[0].isdigit():
-            count = int(args[0])
-        return self._get_recent_logs(user["id"], count)
+        page = 0
+        if args:
+            if args[0].isdigit():
+                count = int(args[0])
+            if len(args) > 1 and args[1].isdigit():
+                page = int(args[1])
+        return self._get_recent_logs(user["id"], count, page)
 
     def grecent(self, args: list[str], user: dict) -> str:
         if user["role"] != "admin":
             return "You don't have permission to use this command."
-        count = 100
-        if args and args[0].isdigit():
-            count = int(args[0])
-        return self._get_recent_logs(None, count)
+        count = 50
+        page = 0
+        if args:
+            if args[0].isdigit():
+                count = int(args[0])
+            if len(args) > 1 and args[1].isdigit():
+                page = int(args[1])
+        return self._get_recent_logs(None, count, page)
 
-    def _get_recent_logs(self, user_id: Optional[int], count: int, show_title_generation: bool = False) -> str:
+    def _get_recent_logs(self, user_id: Optional[int], count: int, page: int, show_title_generation: bool = False) -> str:
         with Session(self.pipeline.engine) as session:
             query = select(UsageLog, User.name, User.id).join(User, UsageLog.user_id == User.id)
             if not show_title_generation:
                 query = query.where(UsageLog.is_title_generation == False)
             if user_id:
                 query = query.where(UsageLog.user_id == user_id)
-            query = query.order_by(UsageLog.created_at.desc()).limit(count)
+            query = query.order_by(UsageLog.created_at.desc()).offset(page * count).limit(count)
 
             results = session.exec(query).all()
 
             if not results:
                 return "No recent usage logs found."
 
-            headers = ["Time", "Model", "Tokens", "Cost", "Content", "Is Stream"]
+            headers = ["Time", "Model", "Tokens", "Cost", "Content", "Stream"]
             if not user_id:
                 headers.insert(1, "User")
 
             data = []
             for r in results:
-                content = r.UsageLog.content[:10] if r.UsageLog.content else "-"
-                if len(r.UsageLog.content) > 10:
+                content = r.UsageLog.content[:20] if r.UsageLog.content else "-"
+                if len(r.UsageLog.content) > 20:
                     content += "..."
                 content = content.replace("\n", "\\n")
                 content = content.replace("\r", "\\r")
                 row = [
-                    r.UsageLog.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    r.UsageLog.created_at.astimezone(pytz.timezone(self.pipeline.valves.TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S"),
                     r.UsageLog.model,
                     r.UsageLog.total_tokens,
                     f"{self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{r.UsageLog.actual_cost:.6f}",
@@ -797,4 +852,4 @@ Your information:
                 data.append(row)
 
             table = tabulate(data, headers=headers, tablefmt="pipe", colalign=("left",))
-            return f"Recent Usage Logs:\n\n{table}"
+            return f"Recent Usage Logs (Page {page}):\n\n{table}"
