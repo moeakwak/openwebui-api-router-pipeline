@@ -24,6 +24,7 @@ import yaml
 from pathlib import Path
 from sqlalchemy import func
 from typing import Optional
+import tiktoken
 
 # Schemas
 
@@ -39,6 +40,9 @@ class Model(BaseModel):
     no_stream: Optional[bool] = Field(default=False, description="If true, do not stream the response. Useful for o1 models.")
     fetch_usage_by_api: Optional[bool] = Field(
         default=False, description="If true, fetch usage from the /generation endpoint, for example, OpenRouter. Only works with stream=true"
+    )
+    fallback_compute_usage: Optional[bool] = Field(
+        default=True, description="If true, compute usage using tiktoken when no usage is found in the response."
     )
     extra_args: Optional[dict] = Field(default=None, description="Extra arguments to pass to the model. Will override the original values.")
 
@@ -256,10 +260,10 @@ class Pipeline:
                 print(f"Unknown message type: {message}")
         return messages
 
-    def generate_usage_cost_message(self, usage: OpenAICompletionUsage, base_cost: float, actual_cost: float, user: User) -> str:
+    def generate_usage_cost_message(self, usage: OpenAICompletionUsage, base_cost: float, actual_cost: float, user: User, is_estimate: bool = False) -> str:
         if base_cost == 0 and actual_cost == 0:
             return "\n\n*(📊 This is a free message)*"
-        return f"\n\n*(📊 Cost {self.valves.ACTUAL_COST_CURRENCY_UNIT}{actual_cost:.6f} | {self.valves.BASE_COST_CURRENCY_UNIT}{base_cost:.6f})*"
+        return f"\n\n*(📊{'Estimated' if is_estimate else ''} Cost {self.valves.ACTUAL_COST_CURRENCY_UNIT}{actual_cost:.6f} | {self.valves.BASE_COST_CURRENCY_UNIT}{base_cost:.6f})*"
 
     def compute_price(self, model: Model, provider: Provider, usage: Optional[OpenAICompletionUsage] = None) -> tuple[float, float]:
         if usage and model.prompt_price and model.completion_price:
@@ -354,6 +358,22 @@ class Pipeline:
             print(f"Failed to fetch usage by API: {generation_response.status_code} {generation_response.text}")
             return None, 0
 
+    def compute_usage_by_tiktoken(self, model: Model, prompt: str, completion: str) -> OpenAICompletionUsage | None:
+        try:
+            if model.code.startswith("gpt-4o"):
+                encoding = tiktoken.encoding_for_model("gpt-4o")
+            elif model.code.startswith("gpt-4"):
+                encoding = tiktoken.encoding_for_model("gpt-4")
+            else:
+                encoding = tiktoken.get_encoding("cl100k_base")
+            prompt_tokens = len(encoding.encode(prompt))
+            completion_tokens = len(encoding.encode(completion))
+            total_tokens = prompt_tokens + completion_tokens
+            return OpenAICompletionUsage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, total_tokens=total_tokens)
+        except Exception as e:
+            print(f"Error computing usage by tiktoken: {e}")
+            return None
+
     def stream_response(
         self,
         r: requests.Response,
@@ -407,13 +427,17 @@ class Pipeline:
 
             if model.fetch_usage_by_api and message_id:
                 usage, _ = self.fetch_usage_by_api(message_id, provider)
+            is_estimate = False
+            if usage is None and model.fallback_compute_usage:
+                usage = self.compute_usage_by_tiktoken(model, user_message, content)
+                is_estimate = True
 
             base_cost, actual_cost = self.compute_price(model, provider, usage)
 
             if self.valves.DISPLAY_COST_AFTER_MESSAGE:
                 if last_chunk:
                     new_chunk = last_chunk.copy()
-                    new_chunk["choices"][0]["delta"]["content"] = self.generate_usage_cost_message(usage, base_cost, actual_cost, user)
+                    new_chunk["choices"][0]["delta"]["content"] = self.generate_usage_cost_message(usage, base_cost, actual_cost, user, is_estimate)
                     yield "data: " + json.dumps(new_chunk) + "\n\n"
                 else:
                     print("Error displaying usage cost: last_chunk is None")
@@ -452,12 +476,17 @@ class Pipeline:
             if model.fetch_usage_by_api and message_id:
                 usage, _ = self.fetch_usage_by_api(message_id, provider)
 
+            is_estimate = False
+            if usage is None and model.fallback_compute_usage:
+                usage = self.compute_usage_by_tiktoken(model, user_message, content)
+                is_estimate = True
+
             base_cost, actual_cost = self.compute_price(model, provider, usage)
             self.add_usage_log(
                 user.id, model.code, usage, base_cost, actual_cost, content=user_message, is_stream=is_stream, is_title_generation=is_title_generation
             )
             if self.valves.DISPLAY_COST_AFTER_MESSAGE:
-                content += self.generate_usage_cost_message(usage, base_cost, actual_cost, user)
+                content += self.generate_usage_cost_message(usage, base_cost, actual_cost, user, is_estimate)
 
             chunk = {
                 **response,
@@ -497,8 +526,14 @@ class Pipeline:
         content = response["choices"][0]["message"]["content"]
         message_id = response.get("id")
 
+        is_estimate = False
+
         if model.fetch_usage_by_api and message_id:
             usage, _ = self.fetch_usage_by_api(message_id, provider)
+            is_estimate = True
+
+        if usage is None and model.fallback_compute_usage:
+            usage = self.compute_usage_by_tiktoken(model, user_message, content)
 
         base_cost, actual_cost = self.compute_price(model, provider, usage)
         self.add_usage_log(
@@ -506,7 +541,7 @@ class Pipeline:
         )
 
         if self.valves.DISPLAY_COST_AFTER_MESSAGE and not is_title_generation:
-            content += self.generate_usage_cost_message(usage, base_cost, actual_cost, user)
+            content += self.generate_usage_cost_message(usage, base_cost, actual_cost, user, is_estimate)
 
         return response
 
@@ -620,7 +655,7 @@ Admin commands:
         price_ratio_map = {}
         for provider in self.pipeline.config.providers:
             price_ratio_map[provider.key] = provider.price_ratio
-            
+
         headers = [
             "Model",
             f"Prompt (per 1M)",
@@ -642,9 +677,19 @@ Admin commands:
             actual_completion_price = completion_price * price_ratio
             actual_per_message_price = per_message_price * price_ratio
 
-            prompt_price_text = f"{actual_cost_currency_unit}{actual_prompt_price:.2f} ({base_cost_currency_unit}{prompt_price:.2f})" if prompt_price > 0 else "-"
-            completion_price_text = f"{actual_cost_currency_unit}{actual_completion_price:.2f} ({base_cost_currency_unit}{completion_price:.2f})" if completion_price > 0 else "-"
-            per_message_price_text = f"{actual_cost_currency_unit}{actual_per_message_price:.2f} ({base_cost_currency_unit}{per_message_price:.2f})" if per_message_price > 0 else "-"
+            prompt_price_text = (
+                f"{actual_cost_currency_unit}{actual_prompt_price:.2f} ({base_cost_currency_unit}{prompt_price:.2f})" if prompt_price > 0 else "-"
+            )
+            completion_price_text = (
+                f"{actual_cost_currency_unit}{actual_completion_price:.2f} ({base_cost_currency_unit}{completion_price:.2f})"
+                if completion_price > 0
+                else "-"
+            )
+            per_message_price_text = (
+                f"{actual_cost_currency_unit}{actual_per_message_price:.2f} ({base_cost_currency_unit}{per_message_price:.2f})"
+                if per_message_price > 0
+                else "-"
+            )
 
             data.append(
                 [
