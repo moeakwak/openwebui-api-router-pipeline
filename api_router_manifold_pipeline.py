@@ -16,7 +16,7 @@ import os
 from pydantic import BaseModel
 import pytz
 import requests
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine, create_engine, distinct
 from sqlmodel import Field, SQLModel, Session, select
 from datetime import datetime, timedelta
 from tabulate import tabulate
@@ -260,7 +260,9 @@ class Pipeline:
                 print(f"Unknown message type: {message}")
         return messages
 
-    def generate_usage_cost_message(self, usage: OpenAICompletionUsage, base_cost: float, actual_cost: float, user: User, is_estimate: bool = False) -> str:
+    def generate_usage_cost_message(
+        self, usage: OpenAICompletionUsage, base_cost: float, actual_cost: float, user: User, is_estimate: bool = False
+    ) -> str:
         if base_cost == 0 and actual_cost == 0:
             return "\n\n*(📊 This is a free message)*"
         return f"\n\n*(📊{'Estimated' if is_estimate else ''} Cost {self.valves.ACTUAL_COST_CURRENCY_UNIT}{actual_cost:.6f} | {self.valves.BASE_COST_CURRENCY_UNIT}{base_cost:.6f})*"
@@ -780,15 +782,19 @@ Your information:
     def gstats(self, args: list[str], user: dict) -> str:
         if user["role"] != "admin":
             return "You don't have permission to use this command."
-        period = "d" if not args else args[0]
+        period = None if not args else args[0]
         return self._get_stats(period)
 
-    def _get_stats(self, period: str, user_id: Optional[int] = None) -> str:
-        time_delta = {
-            "d": timedelta(days=1),
-            "w": timedelta(weeks=1),
-            "m": timedelta(days=30),
-        }.get(period.lower(), timedelta(days=1))
+    def _get_stats(self, period: Optional[str] = None, user_id: Optional[int] = None) -> str:
+
+        if period:
+            time_delta = {
+                "d": timedelta(days=1),
+                "w": timedelta(weeks=1),
+                "m": timedelta(days=30),
+            }.get(period.lower(), None)
+        else:
+            time_delta = None
 
         with Session(self.pipeline.engine) as session:
             query = select(
@@ -799,7 +805,12 @@ Your information:
                 func.sum(UsageLog.cost).label("total_cost"),
                 func.sum(UsageLog.actual_cost).label("total_actual_cost"),
                 func.count().label("count"),
-            ).where(UsageLog.created_at >= datetime.now() - time_delta)
+                func.group_concat(distinct(User.name)).label("unique_user_names")
+            ).join(User, UsageLog.user_id == User.id)
+
+            if time_delta:
+                start_time = datetime.now() - time_delta
+                query = query.where(UsageLog.created_at >= start_time)
 
             if user_id:
                 query = query.where(UsageLog.user_id == user_id)
@@ -808,12 +819,30 @@ Your information:
 
             results = session.exec(query).all()
 
+            if time_delta:
+                start_time = datetime.now() - time_delta
+                query = query.where(UsageLog.created_at >= start_time)
+
+            if user_id:
+                query = query.where(UsageLog.user_id == user_id)
+
+            query = query.group_by(UsageLog.model)
+
+            results = session.exec(query).all()
+
+            print(results[0])
+
             if not results:
                 return "No usage records found for the specified time period."
 
             headers = ["Model", "Prompt Tokens", "Completion Tokens", "Total Tokens", "Base Cost", "Actual Cost", "Usage Count"]
+            if not user_id:
+                headers.append("Unique Users")
             data = [
-                [
+                
+            ]
+            for r in results:
+                row =[
                     r.model,
                     r.total_prompt_tokens,
                     r.total_completion_tokens,
@@ -822,20 +851,31 @@ Your information:
                     f"{self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{r.total_actual_cost:.6f}",
                     r.count,
                 ]
-                for r in results
+                if not user_id:
+                    row.append(r.unique_user_names)
+                data.append(row)
+            # sum row
+            sum_row = [
+                "Sum",
+                sum(r.total_prompt_tokens for r in results),
+                sum(r.total_completion_tokens for r in results),
+                sum(r.total_tokens for r in results),
+                f"{self.pipeline.valves.BASE_COST_CURRENCY_UNIT}{sum(r.total_cost for r in results):.6f}",
+                f"{self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{sum(r.total_actual_cost for r in results):.6f}",
+                sum(r.count for r in results),
             ]
-
             if not user_id:
-                unique_users = session.exec(
-                    select(func.count(func.distinct(UsageLog.user_id))).where(UsageLog.created_at >= datetime.now() - time_delta)
-                ).first()
-                headers.append("Unique Users")
-                for row in data:
-                    row.append(unique_users)
+                sum_row.append(len(set(name for r in results for name in r.unique_user_names.split(",") if name)))
+            data.append(sum_row)
 
             table = tabulate(data, headers=headers, tablefmt="pipe", colalign=("left",))
-            period_str = {"d": "Daily", "w": "Weekly", "m": "Monthly"}.get(period.lower(), "Daily")
-            return f"{period_str} Statistics:\n\n{table}"
+            if period:
+                period_str = {"d": "Daily", "w": "Weekly", "m": "Monthly"}.get(period.lower(), "Daily")
+                resp = f"{period_str} Statistics from {start_time.strftime('%Y-%m-%d %H:%M:%S')} to {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}:\n\n{table}"
+            else:
+                resp = f"All time Statistics:\n\n{table}"
+
+            return resp
 
     def recent(self, args: list[str], user: dict) -> str:
         count = 20
