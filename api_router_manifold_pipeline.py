@@ -301,7 +301,10 @@ class Pipeline:
         if model.extra_args:
             payload = {**payload, **model.extra_args}
 
+        display_usage_cost = body.get("display_usage_cost")
         args = {"is_title_generation": "RESPOND ONLY WITH THE TITLE" in user_message, "is_stream": body.get("stream")}
+        if display_usage_cost is not None:
+            args["display_usage_cost"] = display_usage_cost
 
         fake_stream = False
 
@@ -401,6 +404,7 @@ class Pipeline:
         user_message: str,
         is_title_generation: bool = False,
         is_stream: bool = True,
+        display_usage_cost: bool = True,
     ):
         def generate():
             content = ""
@@ -452,7 +456,7 @@ class Pipeline:
 
             base_cost, actual_cost = self.compute_price(model, provider, usage)
 
-            if self.valves.DISPLAY_COST_AFTER_MESSAGE:
+            if self.valves.DISPLAY_COST_AFTER_MESSAGE and display_usage_cost and not is_title_generation:
                 if last_chunk:
                     new_chunk = last_chunk.copy()
                     new_chunk["choices"][0]["delta"]["content"] = self.generate_usage_cost_message(usage, base_cost, actual_cost, user, is_estimate)
@@ -482,6 +486,7 @@ class Pipeline:
         messages: list[dict],
         user_message: str,
         is_title_generation: bool = False,
+        display_usage_cost: bool = True,
         is_stream: bool = True,
     ):
         def generate():
@@ -504,7 +509,7 @@ class Pipeline:
             self.add_usage_log(
                 user.id, model.code, usage, base_cost, actual_cost, content=user_message, is_stream=is_stream, is_title_generation=is_title_generation
             )
-            if self.valves.DISPLAY_COST_AFTER_MESSAGE:
+            if self.valves.DISPLAY_COST_AFTER_MESSAGE and display_usage_cost and not is_title_generation:
                 content += self.generate_usage_cost_message(usage, base_cost, actual_cost, user, is_estimate)
 
             chunk = {
@@ -539,6 +544,7 @@ class Pipeline:
         messages: list[dict],
         user_message: str,
         is_title_generation: bool = False,
+        display_usage_cost: bool = False,
         is_stream: bool = True,
     ):
         response = r.json()
@@ -560,7 +566,7 @@ class Pipeline:
             user.id, model.code, usage, base_cost, actual_cost, content=user_message, is_stream=is_stream, is_title_generation=is_title_generation
         )
 
-        if self.valves.DISPLAY_COST_AFTER_MESSAGE and not is_title_generation:
+        if self.valves.DISPLAY_COST_AFTER_MESSAGE and display_usage_cost and not is_title_generation:
             content += self.generate_usage_cost_message(usage, base_cost, actual_cost, user, is_estimate)
 
         return response
