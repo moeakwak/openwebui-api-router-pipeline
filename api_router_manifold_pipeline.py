@@ -2,7 +2,7 @@
 title: API Router Manifold Pipeline
 author: Moeakwak
 date: 2024-10-12
-version: 0.1.1
+version: 0.1.2
 license: MIT
 description: A pipeline for routing OpenAI models, track user usages, etc.
 requirements: sqlmodel, sqlalchemy, requests, pathlib, tabulate
@@ -24,6 +24,7 @@ from pathlib import Path
 from sqlalchemy import func
 from typing import Optional
 import tiktoken
+import argparse
 
 # Schemas
 
@@ -95,10 +96,6 @@ class UsageLog(SQLModel, table=True):
     actual_cost: float = Field(description="Actual cost of the usage, after applying the price ratio of the provider.")
     content: Optional[str] = Field(default=None, description="The content of the prompt. Only applicable if RECORD_CONTENT is true.")
     created_at: datetime = Field(default_factory=datetime.now, index=True)
-
-
-def escape_pipeline_id(pipeline_id: str) -> str:
-    return pipeline_id.replace("/", "_")
 
 
 class Pipeline:
@@ -201,7 +198,7 @@ class Pipeline:
                     raise Exception(f"Per message price must be set for model {model.code}")
             else:
                 raise Exception(f"Model {model.code} must have either prompt price, completion price, or per message price set.")
-            models[escape_pipeline_id(f"{model.provider}/{model.code}")] = model
+            models[f"{model.provider}_{model.code}"] = model
 
         return models
 
@@ -370,7 +367,7 @@ class Pipeline:
                 encoding = tiktoken.encoding_for_model("gpt-4")
             else:
                 encoding = tiktoken.get_encoding("cl100k_base")
-            
+
             # Count tokens in messages
             messages_tokens = 0
             for message in messages:
@@ -385,7 +382,7 @@ class Pipeline:
                             messages_tokens += len(encoding.encode(item.get("text", "")))
                         elif isinstance(item, str):
                             messages_tokens += len(encoding.encode(item))
-            
+
             prompt_tokens = len(encoding.encode(prompt)) + messages_tokens
             completion_tokens = len(encoding.encode(completion))
             total_tokens = prompt_tokens + completion_tokens
@@ -623,12 +620,89 @@ class Pipeline:
         return bot.handle_command(message, user)
 
 
+def add_user_parsers(subparsers: argparse._SubParsersAction) -> dict[str, argparse.ArgumentParser]:
+    # Stats command
+    stats_parser: argparse.ArgumentParser = subparsers.add_parser("stats", help="Show usage statistics")
+    stats_parser.add_argument("-p", "--period", choices=["d", "w", "m"], default="d", help="Period (d: daily, w: weekly, m: monthly)")
+
+    # Recent command
+    recent_parser: argparse.ArgumentParser = subparsers.add_parser("recent", help="Show recent usage logs")
+    recent_parser.add_argument("-c", "--count", type=int, default=20, help="Number of logs to show")
+    recent_parser.add_argument("-p", "--page", type=int, default=0, help="Page number")
+
+    # Models command
+    models_parser: argparse.ArgumentParser = subparsers.add_parser("models", help="Show all models and their prices")
+    models_parser.add_argument("--full", action="store_true", help="Show full model ids (for api calls)")
+
+    # Add other basic commands
+    help_parser: argparse.ArgumentParser = subparsers.add_parser("help", help="Show help")
+    help_parser.add_argument("help_command", nargs="?", help="Command to show help for")
+
+    me_parser: argparse.ArgumentParser = subparsers.add_parser("me", help="Show your information and balance")
+
+    return {
+        "stats": stats_parser,
+        "recent": recent_parser,
+        "models": models_parser,
+        "help": help_parser,
+        "me": me_parser,
+    }
+
+
+def get_user_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParser]]:
+    # User parser
+    parser = argparse.ArgumentParser(description="User commands")
+    subparsers = parser.add_subparsers(dest="command")
+    added_parsers_map = add_user_parsers(subparsers)
+    return parser, added_parsers_map
+
+
+def get_admin_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParser]]:
+    # Admin parser
+    parser = argparse.ArgumentParser(description="Admin commands")
+    subparsers = parser.add_subparsers(dest="command")
+    added_parsers_map = add_user_parsers(subparsers)
+
+    # Admin-only commands
+    topup_parser = subparsers.add_parser("topup", help="Top up user balance")
+    topup_parser.add_argument("--user", required=True, help="User ID or email")
+    topup_parser.add_argument("--amount", type=float, required=True, help="Amount to add")
+
+    set_balance_parser = subparsers.add_parser("set_balance", help="Set user balance")
+    set_balance_parser.add_argument("--user", required=True, help="User ID or email")
+    set_balance_parser.add_argument("--amount", type=float, required=True, help="New balance amount")
+
+    gstats_parser = subparsers.add_parser("gstats", help="Show global usage statistics")
+    gstats_parser.add_argument("-p", "--period", choices=["d", "w", "m"], help="Period (d: daily, w: weekly, m: monthly)")
+
+    grecent_parser = subparsers.add_parser("grecent", help="Show global recent usage logs")
+    grecent_parser.add_argument("-c", "--count", type=int, default=50, help="Number of logs to show")
+    grecent_parser.add_argument("-p", "--page", type=int, default=0, help="Page number")
+    grecent_parser.add_argument("-m", "--model", type=str, default=None, help="Filter by model")
+    grecent_parser.add_argument("-u", "--user", type=str, default=None, help="Filter by user id")
+
+    list_users_parser = subparsers.add_parser("users", help="List all users")
+
+    added_parsers_map.update({
+        "topup": topup_parser,
+        "set_balance": set_balance_parser,
+        "users": list_users_parser,
+        "gstats": gstats_parser,
+        "grecent": grecent_parser,
+    })
+
+    return parser, added_parsers_map
+
+
+def clean_usage(usage_text: str) -> str:
+    usage_text = re.sub(r"uvicorn ?", "", usage_text)
+    return usage_text
+
 class ServiceBot:
     def __init__(self, pipeline: Pipeline):
         self.pipeline = pipeline
         self.commands = {
-            "help": self.help,
-            "info": self.info,
+            "models": self.models,
             "me": self.me,
             "topup": self.topup,
             "set_balance": self.set_balance,
@@ -639,45 +713,74 @@ class ServiceBot:
             "grecent": self.grecent,
         }
 
-    def parse_command(self, message: str) -> tuple[str, list[str]]:
-        parts = message.strip().split()
-        command = parts[0].lower()
-        args = parts[1:]
-        return command, args
-
     def handle_command(self, message: str, user: dict) -> str:
-        command, args = self.parse_command(message)
+        is_admin = user["role"] == "admin"
+        parser, added_parsers_map = get_admin_parser() if is_admin else get_user_parser()
+        help_text = f"```\n{clean_usage(parser.format_help())}\n```\n\nType `help <command>` for more information about a command."
 
-        if command not in self.commands:
-            return "Unknown command. Type 'help' for a list of available commands."
+        try:
+            args = parser.parse_args(message.strip().split())
+        except SystemExit:
+            return "Invalid command.\n\n" + help_text
+        except Exception as e:
+            print(e)
+            return "Invalid command.\n\n" + help_text
 
-        if command in ["topup", "set_balance", "users", "gstats", "grecent"] and user["role"] != "admin":
-            return "You don't have permission to use this command."
+        if not args.command:
+            return "No command specified.\n\n" + help_text
+        if args.command not in self.commands and args.command not in added_parsers_map:
+            return "Unknown command.\n\n" + help_text
 
-        return self.commands[command](args, user)
+        if args.command in ["topup", "set_balance", "users", "gstats", "grecent"] and not is_admin:
+            return help_text
 
-    def help(self, args: list[str], user: dict) -> str:
-        help_text = """
-Available commands:
-- **help**: Show this help message
-- **info**: List all model information
-- **me**: Show your user information
-- **stats** [d/w/m]: Show your usage statistics (d: daily, w: weekly, m: monthly, default: daily)
-- **recent** [count] [page]: Show your recent usage logs (default count: 20, default page: 0)
-"""
-        if user["role"] == "admin":
-            help_text += """
+        if args.command == "help":
+            if args.help_command:
+                return f"```\n{clean_usage(added_parsers_map[args.help_command].format_help())}\n```"
+            else:
+                return help_text
+            
+        try:
+            result = self.commands[args.command](args, user)
+        except Exception as e:
+            return "An error occurred while executing the command.\n\n" + f"```\n{clean_usage(added_parsers_map[args.command].format_usage())}\n```"
 
-Admin commands:
-- **topup** [user id/email] [amount]: Top up a user's balance
-- **set_balance** [user id/email] [amount]: Set a user's balance
-- **users**: List all users
-- **gstats** [d/w/m]: Show global usage statistics (d: daily, w: weekly, m: monthly, default: daily)
-- **grecent** [count] [page]: Show global recent usage logs (default count: 50, default page: 0)
-"""
-        return help_text.strip()
+        return result
 
-    def info(self, args: list[str], user: dict) -> str:
+    # Update the command methods to use the new args format
+    def stats(self, args: argparse.Namespace, user: dict) -> str:
+        return self._get_stats(args.period, user["id"])
+
+    def gstats(self, args: argparse.Namespace, user: dict) -> str:
+        return self._get_stats(args.period)
+
+    def recent(self, args: argparse.Namespace, user: dict) -> str:
+        return self._get_recent_logs(args.count, args.page, user["id"])
+
+    def grecent(self, args: argparse.Namespace, user: dict) -> str:
+        return self._get_recent_logs(args.count, args.page, args.user, args.model)
+
+    def topup(self, args: argparse.Namespace, user: dict) -> str:
+        with Session(self.pipeline.engine) as session:
+            db_user = session.exec(select(User).where((User.id == args.user) | (User.email == args.user))).first()
+            if not db_user:
+                return "User not found."
+            db_user.balance += args.amount
+            db_user.updated_at = datetime.now()
+            session.commit()
+            return f"Successfully topped up {db_user.email}'s balance by {self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{args.amount:.2f}. New balance: {self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{db_user.balance:.2f}"
+
+    def set_balance(self, args: argparse.Namespace, user: dict) -> str:
+        with Session(self.pipeline.engine) as session:
+            db_user = session.exec(select(User).where((User.id == args.user) | (User.email == args.user))).first()
+            if not db_user:
+                return "User not found."
+            db_user.balance = args.amount
+            db_user.updated_at = datetime.now()
+            session.commit()
+            return f"Successfully set {db_user.email}'s balance to {self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{args.amount:.2f}"
+
+    def models(self, args: argparse.Namespace, user: dict) -> str:
         price_ratio_map = {}
         for provider in self.pipeline.config.providers:
             price_ratio_map[provider.key] = provider.price_ratio
@@ -689,9 +792,11 @@ Admin commands:
             f"Per Message",
             "Ratio",
         ]
+        if args.full:
+            headers.insert(1, "Slug")
         data = []
 
-        for model in self.pipeline.models.values():
+        for model_id, model in self.pipeline.models.items():
             prompt_price = model.prompt_price or 0
             completion_price = model.completion_price or 0
             per_message_price = model.per_message_price or 0
@@ -717,18 +822,21 @@ Admin commands:
                 else "-"
             )
 
-            data.append(
-                [
-                    model.human_name or model.code,
-                    prompt_price_text,
-                    completion_price_text,
-                    per_message_price_text,
-                    price_ratio_map[model.provider] or "-",
-                ]
-            )
+            item = [
+                model.human_name or model.code,
+                prompt_price_text,
+                completion_price_text,
+                per_message_price_text,
+                price_ratio_map[model.provider] or "-",
+            ]
+            if args.full:
+                item.insert(1, f"{self.pipeline.id}.{model_id}")
+
+            data.append(item)
+
         return f"{tabulate(data, headers=headers, tablefmt='pipe', colalign=('left',))}"
 
-    def me(self, args: list[str], user: dict) -> str:
+    def me(self, args: argparse.Namespace, user: dict) -> str:
         with Session(self.pipeline.engine) as session:
             db_user = session.exec(select(User).where(User.email == user["email"])).first()
             if not db_user:
@@ -743,45 +851,7 @@ Your information:
 - Created at: {db_user.created_at}
 """.strip()
 
-    def topup(self, args: list[str], user: dict) -> str:
-        if len(args) != 2:
-            return "Usage: topup [user id/email] [amount]"
-
-        user_id_or_email, amount = args
-        try:
-            amount = float(amount)
-        except ValueError:
-            return "Invalid amount. Please provide a numeric value."
-
-        with Session(self.pipeline.engine) as session:
-            db_user = session.exec(select(User).where((User.id == user_id_or_email) | (User.email == user_id_or_email))).first()
-            if not db_user:
-                return "User not found."
-            db_user.balance += amount
-            db_user.updated_at = datetime.now()  # 更新updated_at字段
-            session.commit()
-            return f"Successfully topped up {db_user.email}'s balance by {self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{amount:.2f}. New balance: {self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{db_user.balance:.2f}"
-
-    def set_balance(self, args: list[str], user: dict) -> str:
-        if len(args) != 2:
-            return "Usage: set_balance [user id/email] [amount]"
-
-        user_id_or_email, amount = args
-        try:
-            amount = float(amount)
-        except ValueError:
-            return "Invalid amount. Please provide a numeric value."
-
-        with Session(self.pipeline.engine) as session:
-            db_user = session.exec(select(User).where((User.id == user_id_or_email) | (User.email == user_id_or_email))).first()
-            if not db_user:
-                return "User not found."
-            db_user.balance = amount
-            db_user.updated_at = datetime.now()  # 更新updated_at字段
-            session.commit()
-            return f"Successfully set {db_user.email}'s balance to ${amount:.2f}"
-
-    def users(self, args: list[str], user: dict) -> str:
+    def users(self, args: argparse.Namespace, user: dict) -> str:
         with Session(self.pipeline.engine) as session:
             users = session.exec(select(User)).all()
             headers = ["ID", "Name", "Email", "Balance", "Role", "Updated At", "Created At"]
@@ -798,16 +868,6 @@ Your information:
                 for u in users
             ]
             return f"{tabulate(data, headers=headers, tablefmt='pipe', colalign=('left',))}"
-
-    def stats(self, args: list[str], user: dict) -> str:
-        period = "d" if not args else args[0]
-        return self._get_stats(period, user["id"])
-
-    def gstats(self, args: list[str], user: dict) -> str:
-        if user["role"] != "admin":
-            return "You don't have permission to use this command."
-        period = None if not args else args[0]
-        return self._get_stats(period)
 
     def _get_stats(self, period: Optional[str] = None, user_id: Optional[int] = None) -> str:
 
@@ -829,7 +889,7 @@ Your information:
                 func.sum(UsageLog.cost).label("total_cost"),
                 func.sum(UsageLog.actual_cost).label("total_actual_cost"),
                 func.count().label("count"),
-                func.group_concat(distinct(User.name)).label("unique_user_names")
+                func.group_concat(distinct(User.name)).label("unique_user_names"),
             ).join(User, UsageLog.user_id == User.id)
 
             if time_delta:
@@ -862,11 +922,9 @@ Your information:
             headers = ["Model", "Prompt Tokens", "Completion Tokens", "Total Tokens", "Base Cost", "Actual Cost", "Usage Count"]
             if not user_id:
                 headers.append("Unique Users")
-            data = [
-                
-            ]
+            data = []
             for r in results:
-                row =[
+                row = [
                     r.model,
                     r.total_prompt_tokens,
                     r.total_completion_tokens,
@@ -901,35 +959,15 @@ Your information:
 
             return resp
 
-    def recent(self, args: list[str], user: dict) -> str:
-        count = 20
-        page = 0
-        if args:
-            if args[0].isdigit():
-                count = int(args[0])
-            if len(args) > 1 and args[1].isdigit():
-                page = int(args[1])
-        return self._get_recent_logs(user["id"], count, page)
-
-    def grecent(self, args: list[str], user: dict) -> str:
-        if user["role"] != "admin":
-            return "You don't have permission to use this command."
-        count = 50
-        page = 0
-        if args:
-            if args[0].isdigit():
-                count = int(args[0])
-            if len(args) > 1 and args[1].isdigit():
-                page = int(args[1])
-        return self._get_recent_logs(None, count, page)
-
-    def _get_recent_logs(self, user_id: Optional[int], count: int, page: int, show_title_generation: bool = False) -> str:
+    def _get_recent_logs(self, count: int, page: int, user_id: Optional[int] = None, model: Optional[str] = None, show_title_generation: bool = False) -> str:
         with Session(self.pipeline.engine) as session:
             query = select(UsageLog, User.name, User.id).join(User, UsageLog.user_id == User.id)
             if not show_title_generation:
                 query = query.where(UsageLog.is_title_generation == False)
             if user_id:
                 query = query.where(UsageLog.user_id == user_id)
+            if model:
+                query = query.where(UsageLog.model.like(f"%{model}%"))
             query = query.order_by(UsageLog.created_at.desc()).offset(page * count).limit(count)
 
             results = session.exec(query).all()
