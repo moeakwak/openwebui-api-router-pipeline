@@ -2,13 +2,12 @@
 title: API Router Manifold Pipeline
 author: Moeakwak
 date: 2024-10-12
-version: 0.1.0
+version: 0.1.1
 license: MIT
 description: A pipeline for routing OpenAI models, track user usages, etc.
 requirements: sqlmodel, sqlalchemy, requests, pathlib, tabulate
 """
 
-import enum
 import json
 import re
 from typing import Literal, Optional, Union, Generator, Iterator
@@ -333,11 +332,11 @@ class Pipeline:
             r.raise_for_status()
 
             if not fake_stream and body["stream"]:
-                return self.stream_response(r, model, provider, user, user_message, **args)
+                return self.stream_response(r, model, provider, user, messages, user_message, **args)
             elif fake_stream:
-                return self.fake_stream_response(r, model, provider, user, user_message, **args)
+                return self.fake_stream_response(r, model, provider, user, messages, user_message, **args)
             else:
-                return self.non_stream_response(r, model, provider, user, user_message, **args)
+                return self.non_stream_response(r, model, provider, user, messages, user_message, **args)
 
         except Exception as e:
             raise e
@@ -360,7 +359,7 @@ class Pipeline:
             print(f"Failed to fetch usage by API: {generation_response.status_code} {generation_response.text}")
             return None, 0
 
-    def compute_usage_by_tiktoken(self, model: Model, prompt: str, completion: str) -> OpenAICompletionUsage | None:
+    def compute_usage_by_tiktoken(self, model: Model, messages: list[dict], prompt: str, completion: str) -> OpenAICompletionUsage | None:
         try:
             if model.code.startswith("gpt-4o"):
                 encoding = tiktoken.encoding_for_model("gpt-4o")
@@ -368,7 +367,23 @@ class Pipeline:
                 encoding = tiktoken.encoding_for_model("gpt-4")
             else:
                 encoding = tiktoken.get_encoding("cl100k_base")
-            prompt_tokens = len(encoding.encode(prompt))
+            
+            # Count tokens in messages
+            messages_tokens = 0
+            for message in messages:
+                # Handle different content formats according to OpenAI's format
+                content = message.get("content")
+                if isinstance(content, str):
+                    messages_tokens += len(encoding.encode(content))
+                elif isinstance(content, list):
+                    # For multimodal messages, only count text content
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            messages_tokens += len(encoding.encode(item.get("text", "")))
+                        elif isinstance(item, str):
+                            messages_tokens += len(encoding.encode(item))
+            
+            prompt_tokens = len(encoding.encode(prompt)) + messages_tokens
             completion_tokens = len(encoding.encode(completion))
             total_tokens = prompt_tokens + completion_tokens
             return OpenAICompletionUsage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, total_tokens=total_tokens)
@@ -382,6 +397,7 @@ class Pipeline:
         model: Model,
         provider: Provider,
         user: User,
+        messages: list[dict],
         user_message: str,
         is_title_generation: bool = False,
         is_stream: bool = True,
@@ -431,7 +447,7 @@ class Pipeline:
                 usage, _ = self.fetch_usage_by_api(message_id, provider)
             is_estimate = False
             if usage is None and model.fallback_compute_usage:
-                usage = self.compute_usage_by_tiktoken(model, user_message, content)
+                usage = self.compute_usage_by_tiktoken(model, messages, user_message, content)
                 is_estimate = True
 
             base_cost, actual_cost = self.compute_price(model, provider, usage)
@@ -463,6 +479,7 @@ class Pipeline:
         model: Model,
         provider: Provider,
         user: User,
+        messages: list[dict],
         user_message: str,
         is_title_generation: bool = False,
         is_stream: bool = True,
@@ -480,7 +497,7 @@ class Pipeline:
 
             is_estimate = False
             if usage is None and model.fallback_compute_usage:
-                usage = self.compute_usage_by_tiktoken(model, user_message, content)
+                usage = self.compute_usage_by_tiktoken(model, messages, user_message, content)
                 is_estimate = True
 
             base_cost, actual_cost = self.compute_price(model, provider, usage)
@@ -519,6 +536,7 @@ class Pipeline:
         model: Model,
         provider: Provider,
         user: User,
+        messages: list[dict],
         user_message: str,
         is_title_generation: bool = False,
         is_stream: bool = True,
@@ -535,7 +553,7 @@ class Pipeline:
             is_estimate = True
 
         if usage is None and model.fallback_compute_usage:
-            usage = self.compute_usage_by_tiktoken(model, user_message, content)
+            usage = self.compute_usage_by_tiktoken(model, messages, user_message, content)
 
         base_cost, actual_cost = self.compute_price(model, provider, usage)
         self.add_usage_log(
