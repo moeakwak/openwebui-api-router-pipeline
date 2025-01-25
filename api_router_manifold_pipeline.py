@@ -1,8 +1,8 @@
 """
 title: API Router Manifold Pipeline
 author: Moeakwak
-date: 2024-10-12
-version: 0.1.2
+date: 2024-12-06
+version: 0.1.3
 license: MIT
 description: A pipeline for routing OpenAI models, track user usages, etc.
 requirements: sqlmodel, sqlalchemy, requests, pathlib, tabulate
@@ -15,7 +15,7 @@ import os
 from pydantic import BaseModel
 import pytz
 import requests
-from sqlalchemy import Engine, create_engine, distinct
+from sqlalchemy import Engine, create_engine, desc, distinct
 from sqlmodel import Field, SQLModel, Session, select
 from datetime import datetime, timedelta
 from tabulate import tabulate
@@ -25,6 +25,7 @@ from sqlalchemy import func
 from typing import Optional
 import tiktoken
 import argparse
+import urllib.parse
 
 # Schemas
 
@@ -87,6 +88,7 @@ class UsageLog(SQLModel, table=True):
     id: int = Field(default=None, primary_key=True)
     user_id: int = Field(foreign_key="user.id")
     model: str = Field(index=True)
+    provider: str = Field(index=True)
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
@@ -96,6 +98,10 @@ class UsageLog(SQLModel, table=True):
     actual_cost: float = Field(description="Actual cost of the usage, after applying the price ratio of the provider.")
     content: Optional[str] = Field(default=None, description="The content of the prompt. Only applicable if RECORD_CONTENT is true.")
     created_at: datetime = Field(default_factory=datetime.now, index=True)
+
+
+def escape_model_code(code: str):
+    return code.replace("/", "__")
 
 
 class Pipeline:
@@ -198,7 +204,7 @@ class Pipeline:
                     raise Exception(f"Per message price must be set for model {model.code}")
             else:
                 raise Exception(f"Model {model.code} must have either prompt price, completion price, or per message price set.")
-            models[f"{model.provider}_{model.code}"] = model
+            models[f"{model.provider}_{escape_model_code(model.code)}"] = model
 
         return models
 
@@ -469,7 +475,7 @@ class Pipeline:
             yield "data: [DONE]"
 
             self.add_usage_log(
-                user.id, model.code, usage, base_cost, actual_cost, content=user_message, is_stream=is_stream, is_title_generation=is_title_generation
+                user.id, model, usage, base_cost, actual_cost, content=user_message, is_stream=is_stream, is_title_generation=is_title_generation
             )
 
         return generate()
@@ -504,7 +510,7 @@ class Pipeline:
 
             base_cost, actual_cost = self.compute_price(model, provider, usage)
             self.add_usage_log(
-                user.id, model.code, usage, base_cost, actual_cost, content=user_message, is_stream=is_stream, is_title_generation=is_title_generation
+                user.id, model, usage, base_cost, actual_cost, content=user_message, is_stream=is_stream, is_title_generation=is_title_generation
             )
             if self.valves.DISPLAY_COST_AFTER_MESSAGE and display_usage_cost and not is_title_generation:
                 content += self.generate_usage_cost_message(usage, base_cost, actual_cost, user, is_estimate)
@@ -560,7 +566,7 @@ class Pipeline:
 
         base_cost, actual_cost = self.compute_price(model, provider, usage)
         self.add_usage_log(
-            user.id, model.code, usage, base_cost, actual_cost, content=user_message, is_stream=is_stream, is_title_generation=is_title_generation
+            user.id, model, usage, base_cost, actual_cost, content=user_message, is_stream=is_stream, is_title_generation=is_title_generation
         )
 
         if self.valves.DISPLAY_COST_AFTER_MESSAGE and display_usage_cost and not is_title_generation:
@@ -571,7 +577,7 @@ class Pipeline:
     def add_usage_log(
         self,
         user_id: int,
-        model: str,
+        model: Model,
         usage: Optional[OpenAICompletionUsage],
         base_cost: float,
         actual_cost: float,
@@ -596,7 +602,8 @@ class Pipeline:
 
                     usage_log = UsageLog(
                         user_id=user.id,
-                        model=model,
+                        model=model.code,
+                        provider=model.provider,
                         prompt_tokens=usage.prompt_tokens if usage else 0,
                         completion_tokens=usage.completion_tokens if usage else 0,
                         total_tokens=usage.total_tokens if usage else 0,
@@ -674,7 +681,8 @@ def get_admin_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
 
     gstats_parser = subparsers.add_parser("gstats", help="Show global usage statistics")
     gstats_parser.add_argument("-p", "--period", choices=["d", "w", "m"], help="Period (d: daily, w: weekly, m: monthly)")
-
+    gstats_parser.add_argument("-m", "--model", type=str, default=None, help="Filter by model")
+    
     grecent_parser = subparsers.add_parser("grecent", help="Show global recent usage logs")
     grecent_parser.add_argument("-c", "--count", type=int, default=50, help="Number of logs to show")
     grecent_parser.add_argument("-p", "--page", type=int, default=0, help="Page number")
@@ -749,10 +757,10 @@ class ServiceBot:
 
     # Update the command methods to use the new args format
     def stats(self, args: argparse.Namespace, user: dict) -> str:
-        return self._get_stats(args.period, user["id"])
+        return self._get_model_stats(args.period, user["id"])
 
     def gstats(self, args: argparse.Namespace, user: dict) -> str:
-        return self._get_stats(args.period)
+        return self._get_model_stats(args.period) + "\n\n" + self._get_user_stats(args.period, args.model)
 
     def recent(self, args: argparse.Namespace, user: dict) -> str:
         return self._get_recent_logs(args.count, args.page, user["id"])
@@ -869,7 +877,7 @@ Your information:
             ]
             return f"{tabulate(data, headers=headers, tablefmt='pipe', colalign=('left',))}"
 
-    def _get_stats(self, period: Optional[str] = None, user_id: Optional[int] = None) -> str:
+    def _get_model_stats(self, period: Optional[str] = None, user_id: Optional[int] = None) -> str:
 
         if period:
             time_delta = {
@@ -959,6 +967,88 @@ Your information:
 
             return resp
 
+    def _get_user_stats(self, period: Optional[str] = None, model: Optional[str] = None) -> str:
+        with Session(self.pipeline.engine) as session:
+            # 计算时间范围
+            start_time = None
+            if period:
+                now = datetime.now()
+                if period.lower() == "d":
+                    start_time = now - timedelta(days=1)
+                elif period.lower() == "w":
+                    start_time = now - timedelta(weeks=1)
+                elif period.lower() == "m":
+                    start_time = now - timedelta(days=30)
+
+            # 构建查询
+            query = (
+                select(
+                    User.name,
+                    User.id,
+                    func.sum(UsageLog.prompt_tokens).label("total_prompt_tokens"),
+                    func.sum(UsageLog.completion_tokens).label("total_completion_tokens"),
+                    func.sum(UsageLog.total_tokens).label("total_tokens"),
+                    func.sum(UsageLog.cost).label("total_cost"),
+                    func.sum(UsageLog.actual_cost).label("total_actual_cost"),
+                    func.count(UsageLog.id).label("count"),
+                    func.group_concat(distinct(UsageLog.model)).label("used_models")
+                )
+                .join(UsageLog, User.id == UsageLog.user_id)
+                .where(UsageLog.is_title_generation == False)
+            )
+
+            if start_time:
+                query = query.where(UsageLog.created_at >= start_time)
+            if model:
+                query = query.where(UsageLog.model.like(f"%{model}%"))
+
+            query = query.group_by(User.id).order_by(desc("total_actual_cost"))
+
+            results = session.exec(query).all()
+
+            if not results:
+                return "No usage records found for the specified time period."
+
+            headers = ["User", "ID", "Prompt Tokens", "Completion Tokens", "Total Tokens", "Base Cost", "Actual Cost", "Usage Count", "Used Models"]
+            data = []
+            for r in results:
+                row = [
+                    r.name or "N/A",
+                    r.id,
+                    r.total_prompt_tokens,
+                    r.total_completion_tokens,
+                    r.total_tokens,
+                    f"{self.pipeline.valves.BASE_COST_CURRENCY_UNIT}{r.total_cost:.6f}",
+                    f"{self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{r.total_actual_cost:.6f}",
+                    r.count,
+                    r.used_models.replace(",", ", ")
+                ]
+                data.append(row)
+
+            # Add summary row
+            sum_row = [
+                "Total",
+                "-",
+                sum(r.total_prompt_tokens for r in results),
+                sum(r.total_completion_tokens for r in results),
+                sum(r.total_tokens for r in results),
+                f"{self.pipeline.valves.BASE_COST_CURRENCY_UNIT}{sum(r.total_cost for r in results):.6f}",
+                f"{self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{sum(r.total_actual_cost for r in results):.6f}",
+                sum(r.count for r in results),
+                "-"
+            ]
+            data.append(sum_row)
+
+            table = tabulate(data, headers=headers, tablefmt="pipe", colalign=("left",))
+            if period:
+                period_str = {"d": "Daily", "w": "Weekly", "m": "Monthly"}.get(period.lower(), "Daily")
+                resp = f"User {period_str} Statistics (from {start_time.strftime('%Y-%m-%d %H:%M:%S')} to {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}):\n\n{table}"
+            else:
+                resp = f"All Time User Statistics:\n\n{table}"
+
+            return resp
+
+
     def _get_recent_logs(self, count: int, page: int, user_id: Optional[int] = None, model: Optional[str] = None, show_title_generation: bool = False) -> str:
         with Session(self.pipeline.engine) as session:
             query = select(UsageLog, User.name, User.id).join(User, UsageLog.user_id == User.id)
@@ -975,7 +1065,7 @@ Your information:
             if not results:
                 return "No recent usage logs found."
 
-            headers = ["Time", "Model", "Tokens", "Cost", "Content", "Stream"]
+            headers = ["Time", "Provider", "Model", "Tokens", "Cost", "Content", "Stream"]
             if not user_id:
                 headers.insert(1, "User")
 
@@ -988,6 +1078,7 @@ Your information:
                 content = content.replace("\r", "\\r")
                 row = [
                     r.UsageLog.created_at.astimezone(pytz.timezone(self.pipeline.valves.TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S"),
+                    r.UsageLog.provider,
                     r.UsageLog.model,
                     r.UsageLog.total_tokens,
                     f"{self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{r.UsageLog.actual_cost:.6f}",
