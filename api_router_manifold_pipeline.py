@@ -1,8 +1,8 @@
 """
 title: API Router Manifold Pipeline
 author: Moeakwak
-date: 2024-12-06
-version: 0.1.3
+date: 2025-01-25
+version: 0.1.4
 license: MIT
 description: A pipeline for routing OpenAI models, track user usages, etc.
 requirements: sqlmodel, sqlalchemy, requests, pathlib, tabulate
@@ -411,6 +411,7 @@ class Pipeline:
     ):
         def generate():
             content = ""
+            reasoning_content = ""
             usage = None
             last_chunk: dict | None = None
             stop_chunk: dict | None = None
@@ -436,8 +437,11 @@ class Pipeline:
                     continue
 
                 if "choices" in chunk and len(chunk["choices"]) > 0:
-                    content_delta = chunk["choices"][0].get("delta", {}).get("content", "")
+                    delta = chunk["choices"][0].get("delta", {})
+                    content_delta = delta.get("content") or ""
                     content += content_delta
+                    reasoning_delta = delta.get("reasoning_content") or ""
+                    reasoning_content += reasoning_delta
                     # prevent displaying stop chunk
                     if chunk.get("choices", [{}])[0].get("finish_reason") == "stop":
                         stop_chunk = chunk
@@ -454,7 +458,7 @@ class Pipeline:
                 usage, _ = self.fetch_usage_by_api(message_id, provider)
             is_estimate = False
             if usage is None and model.fallback_compute_usage:
-                usage = self.compute_usage_by_tiktoken(model, messages, user_message, content)
+                usage = self.compute_usage_by_tiktoken(model, messages, user_message, reasoning_content + content)
                 is_estimate = True
 
             base_cost, actual_cost = self.compute_price(model, provider, usage)
@@ -682,7 +686,7 @@ def get_admin_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     gstats_parser = subparsers.add_parser("gstats", help="Show global usage statistics")
     gstats_parser.add_argument("-p", "--period", choices=["d", "w", "m"], help="Period (d: daily, w: weekly, m: monthly)")
     gstats_parser.add_argument("-m", "--model", type=str, default=None, help="Filter by model")
-    
+
     grecent_parser = subparsers.add_parser("grecent", help="Show global recent usage logs")
     grecent_parser.add_argument("-c", "--count", type=int, default=50, help="Number of logs to show")
     grecent_parser.add_argument("-p", "--page", type=int, default=0, help="Page number")
@@ -691,13 +695,15 @@ def get_admin_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
 
     list_users_parser = subparsers.add_parser("users", help="List all users")
 
-    added_parsers_map.update({
-        "topup": topup_parser,
-        "set_balance": set_balance_parser,
-        "users": list_users_parser,
-        "gstats": gstats_parser,
-        "grecent": grecent_parser,
-    })
+    added_parsers_map.update(
+        {
+            "topup": topup_parser,
+            "set_balance": set_balance_parser,
+            "users": list_users_parser,
+            "gstats": gstats_parser,
+            "grecent": grecent_parser,
+        }
+    )
 
     return parser, added_parsers_map
 
@@ -705,6 +711,7 @@ def get_admin_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
 def clean_usage(usage_text: str) -> str:
     usage_text = re.sub(r"uvicorn ?", "", usage_text)
     return usage_text
+
 
 class ServiceBot:
     def __init__(self, pipeline: Pipeline):
@@ -747,7 +754,7 @@ class ServiceBot:
                 return f"```\n{clean_usage(added_parsers_map[args.help_command].format_help())}\n```"
             else:
                 return help_text
-            
+
         try:
             result = self.commands[args.command](args, user)
         except Exception as e:
@@ -991,7 +998,7 @@ Your information:
                     func.sum(UsageLog.cost).label("total_cost"),
                     func.sum(UsageLog.actual_cost).label("total_actual_cost"),
                     func.count(UsageLog.id).label("count"),
-                    func.group_concat(distinct(UsageLog.model)).label("used_models")
+                    func.group_concat(distinct(UsageLog.model)).label("used_models"),
                 )
                 .join(UsageLog, User.id == UsageLog.user_id)
                 .where(UsageLog.is_title_generation == False)
@@ -1021,7 +1028,7 @@ Your information:
                     f"{self.pipeline.valves.BASE_COST_CURRENCY_UNIT}{r.total_cost:.6f}",
                     f"{self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{r.total_actual_cost:.6f}",
                     r.count,
-                    r.used_models.replace(",", ", ")
+                    r.used_models.replace(",", ", "),
                 ]
                 data.append(row)
 
@@ -1035,7 +1042,7 @@ Your information:
                 f"{self.pipeline.valves.BASE_COST_CURRENCY_UNIT}{sum(r.total_cost for r in results):.6f}",
                 f"{self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{sum(r.total_actual_cost for r in results):.6f}",
                 sum(r.count for r in results),
-                "-"
+                "-",
             ]
             data.append(sum_row)
 
@@ -1048,8 +1055,9 @@ Your information:
 
             return resp
 
-
-    def _get_recent_logs(self, count: int, page: int, user_id: Optional[int] = None, model: Optional[str] = None, show_title_generation: bool = False) -> str:
+    def _get_recent_logs(
+        self, count: int, page: int, user_id: Optional[int] = None, model: Optional[str] = None, show_title_generation: bool = False
+    ) -> str:
         with Session(self.pipeline.engine) as session:
             query = select(UsageLog, User.name, User.id).join(User, UsageLog.user_id == User.id)
             if not show_title_generation:
