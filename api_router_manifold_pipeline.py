@@ -1,8 +1,8 @@
 """
 title: API Router Manifold Pipeline
 author: Moeakwak
-date: 2025-01-25
-version: 0.1.4
+date: 2025-02-06
+version: 0.1.6
 license: MIT
 description: A pipeline for routing OpenAI models, track user usages, etc.
 requirements: sqlmodel, sqlalchemy, requests, pathlib, tabulate
@@ -26,6 +26,7 @@ from typing import Optional
 import tiktoken
 import argparse
 import urllib.parse
+from enum import Enum, auto
 
 # Schemas
 
@@ -44,6 +45,9 @@ class Model(BaseModel):
     )
     fallback_compute_usage: Optional[bool] = Field(
         default=True, description="If true, compute usage using tiktoken when no usage is found in the response."
+    )
+    include_reasoning: Optional[bool] = Field(
+        default=False, description="If true, enable reasoning feature and add include_reasoning=true to the request payload."
     )
     extra_args: Optional[dict] = Field(default=None, description="Extra arguments to pass to the model. Will override the original values.")
 
@@ -119,6 +123,12 @@ class Pipeline:
             default="$", description="The currency unit of the actual cost, also the currency unit of the user balance."
         )
         TIMEZONE: str = Field(default="UTC", description="The timezone of the server.")
+
+    class ReasoningState(Enum):
+        """Enum for tracking the state of reasoning in stream response"""
+        NOT_STARTED = auto()  # Initial state
+        IN_PROGRESS = auto()  # Currently processing reasoning content
+        COMPLETED = auto()    # Finished reasoning, processing normal content
 
     def __init__(self):
         self.type = "manifold"
@@ -262,6 +272,24 @@ class Pipeline:
                 print(f"Unknown message type: {message}")
         return messages
 
+    def remove_think_tag_in_messages(self, messages: list[dict]) -> list[dict]:
+        """Remove think tags and their content from messages."""
+        for message in messages:
+            if "content" in message:
+                if isinstance(message["content"], str):
+                    # 移除 think 标签及其内容
+                    message["content"] = re.sub(r'<think>\n.*?\n</think>\n\n', '', 
+                                             message["content"], 
+                                             flags=re.DOTALL)
+                elif isinstance(message["content"], list):
+                    # 处理多模态消息
+                    for content in message["content"]:
+                        if isinstance(content, dict) and content.get("type") == "text":
+                            content["text"] = re.sub(r'<think>\n.*?\n</think>\n\n', '', 
+                                                  content["text"], 
+                                                  flags=re.DOTALL)
+        return messages
+
     def generate_usage_cost_message(
         self, usage: OpenAICompletionUsage, base_cost: float, actual_cost: float, user: User, is_estimate: bool = False
     ) -> str:
@@ -299,7 +327,15 @@ class Pipeline:
         headers["Authorization"] = f"Bearer {provider.api_key}"
         headers["Content-Type"] = "application/json"
 
-        payload = {**body, "messages": self.remove_usage_cost_in_messages(messages), "model": model.code, "stream_options": {"include_usage": True}}
+        payload = {
+            **body, 
+            "messages": self.remove_think_tag_in_messages(self.remove_usage_cost_in_messages(messages)), 
+            "model": model.code, 
+            "stream_options": {"include_usage": True}
+        }
+
+        if model.include_reasoning:
+            payload["include_reasoning"] = True
 
         if model.extra_args:
             payload = {**payload, **model.extra_args}
@@ -417,6 +453,9 @@ class Pipeline:
             stop_chunk: dict | None = None
             usage_chunk: dict | None = None
             message_id: str | None = None
+            
+            # Initialize state machine using Enum
+            reasoning_state = self.ReasoningState.NOT_STARTED
 
             for line in r.iter_lines():
                 if not line:
@@ -439,20 +478,36 @@ class Pipeline:
                 if "choices" in chunk and len(chunk["choices"]) > 0:
                     delta = chunk["choices"][0].get("delta", {})
                     content_delta = delta.get("content") or ""
+                    reasoning_delta = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                    
+                    # Handle reasoning state transitions using Enum
+                    if reasoning_state == self.ReasoningState.NOT_STARTED and reasoning_delta:
+                        reasoning_state = self.ReasoningState.IN_PROGRESS
+                        chunk["choices"][0]["delta"]["content"] = "<think>\n" + reasoning_delta
+                    elif reasoning_state == self.ReasoningState.IN_PROGRESS:
+                        if reasoning_delta:
+                            chunk["choices"][0]["delta"]["content"] = reasoning_delta
+                        elif content_delta:
+                            reasoning_state = self.ReasoningState.COMPLETED
+                            chunk["choices"][0]["delta"]["content"] = "\n</think>\n\n" + content_delta
+                        else:
+                            chunk["choices"][0]["delta"]["content"] = content_delta
+
                     content += content_delta
-                    reasoning_delta = delta.get("reasoning_content") or ""
                     reasoning_content += reasoning_delta
+
                     # prevent displaying stop chunk
                     if chunk.get("choices", [{}])[0].get("finish_reason") == "stop":
                         stop_chunk = chunk
                     else:
                         last_chunk = chunk
                         message_id = chunk.get("id") if message_id is None else message_id
-                        yield "data: " + line + "\n\n"
-
+                        yield "data: " + json.dumps(chunk) + "\n\n"
                 elif "usage" in chunk:
                     usage = OpenAICompletionUsage(**chunk["usage"])
                     usage_chunk = chunk
+            
+            # print(f"{model.code} reasoning_content: {reasoning_content}")
 
             if model.fetch_usage_by_api and message_id:
                 usage, _ = self.fetch_usage_by_api(message_id, provider)
@@ -556,7 +611,16 @@ class Pipeline:
     ):
         response = r.json()
         usage = OpenAICompletionUsage(**response["usage"]) if "usage" in response else None
-        content = response["choices"][0]["message"]["content"]
+        
+        # 处理 reasoning content
+        message = response["choices"][0]["message"]
+        content = message["content"]
+        reasoning = message.get("reasoning_content") or message.get("reasoning")
+        
+        if reasoning:
+            content = f"<think>\n{reasoning}\n</think>\n\n{content}"
+            message["content"] = content
+        
         message_id = response.get("id")
 
         is_estimate = False
