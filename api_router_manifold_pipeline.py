@@ -2,10 +2,10 @@
 title: API Router Manifold Pipeline
 author: Moeakwak
 date: 2025-02-13
-version: 0.1.7
+version: 0.2.0
 license: MIT
 description: A pipeline for routing OpenAI models, track user usages, etc.
-requirements: sqlmodel, tabulate
+requirements: tabulate
 """
 
 import json
@@ -27,6 +27,8 @@ import tiktoken
 import argparse
 import urllib.parse
 from enum import Enum, auto
+import time
+import threading
 
 # Schemas
 
@@ -300,11 +302,14 @@ class Pipeline:
         return messages
 
     def generate_usage_cost_message(
-        self, usage: OpenAICompletionUsage, base_cost: float, actual_cost: float, user: User, is_estimate: bool = False
+        self, usage: OpenAICompletionUsage, base_cost: float, actual_cost: float, user: User, is_estimate: bool = False, update_later: bool = False
     ) -> str:
         if base_cost == 0 and actual_cost == 0:
             return "\n\n*(📊 This is a free message)*"
-        return f"\n\n*(📊{'Estimated' if is_estimate else ''} Cost {self.valves.ACTUAL_COST_CURRENCY_UNIT}{actual_cost:.6f} | {self.valves.BASE_COST_CURRENCY_UNIT}{base_cost:.6f})*"
+        message = f"\n\n*(📊{'Estimated' if is_estimate else ''} Cost {self.valves.ACTUAL_COST_CURRENCY_UNIT}{actual_cost:.6f} | {self.valves.BASE_COST_CURRENCY_UNIT}{base_cost:.6f}"
+        if update_later:
+            message += ", actual cost will update later"
+        return message + ")*"
 
     def compute_price(self, model: Model, provider: Provider, usage: Optional[OpenAICompletionUsage] = None) -> tuple[float, float]:
         if usage and model.prompt_price and model.completion_price:
@@ -355,14 +360,8 @@ class Pipeline:
         if display_usage_cost is not None:
             args["display_usage_cost"] = display_usage_cost
 
-        fake_stream = False
-
         if model.no_system_prompt:
             payload["messages"] = [message for message in messages if message["role"] != "system"]
-
-        if model.no_stream and body["stream"]:
-            fake_stream = True
-            payload["stream"] = False
 
         if "user" in payload:
             del payload["user"]
@@ -383,33 +382,79 @@ class Pipeline:
 
             r.raise_for_status()
 
-            if not fake_stream and body["stream"]:
+            if body["stream"]:
                 return self.stream_response(r, model, provider, user, messages, user_message, **args)
-            elif fake_stream:
-                return self.fake_stream_response(r, model, provider, user, messages, user_message, **args)
             else:
                 return self.non_stream_response(r, model, provider, user, messages, user_message, **args)
 
         except Exception as e:
             raise e
 
-    def fetch_usage_by_api(self, message_id: str, provider: Provider) -> OpenAICompletionUsage:
+    def fetch_usage_by_api(self, message_id: str, provider: Provider) -> tuple[OpenAICompletionUsage | None, float, dict]:
         headers = {
             "Authorization": f"Bearer {provider.api_key}",
             "Content-Type": "application/json",
         }
-        generation_response = requests.get(f"{provider.url}/generation", params={"id": message_id}, headers=headers)
-        if generation_response.status_code == 200:
-            data = generation_response.json().get("data", {})
-            prompt_tokens = data.get("native_tokens_prompt", 0)
-            completion_tokens = data.get("native_tokens_completion", 0)
-            total_tokens = prompt_tokens + completion_tokens
-            total_cost = data.get("total_cost", 0)
-            usage = OpenAICompletionUsage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, total_tokens=total_tokens)
-            return usage, total_cost
-        else:
-            print_log(f"Failed to fetch usage by API: {generation_response.status_code} {generation_response.text}")
-            return None, 0
+        try:
+            generation_response = requests.get(f"{provider.url}/generation", params={"id": message_id}, headers=headers)
+            if generation_response.status_code == 200:
+                data = generation_response.json().get("data", {})
+                prompt_tokens = data.get("native_tokens_prompt", 0)
+                completion_tokens = data.get("native_tokens_completion", 0)
+                total_tokens = prompt_tokens + completion_tokens
+                total_cost = data.get("total_cost", 0)
+                usage = OpenAICompletionUsage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, total_tokens=total_tokens)
+                return usage, total_cost, data
+            else:
+                return None, 0, {}
+        except Exception as e:
+            print_log(f"Error fetching usage by API: {e}")
+            return None, 0, {}
+
+    def update_usage_in_background(self, message_id: str, usage_log_id: int, model: Model, provider: Provider, user: User):
+        """后台任务：尝试获取实际使用量并更新数据库记录"""
+        retry_delays = [1, 3, 5, 10]  # 重试延迟时间（秒）
+        
+        for i, delay in enumerate(retry_delays):
+            time.sleep(delay)
+            usage, total_cost, data = self.fetch_usage_by_api(message_id, provider)
+            
+            if usage:
+                with Session(self.engine) as session:
+                    try:
+                        log = session.get(UsageLog, usage_log_id)
+                        if log:
+                            # 计算新的成本
+                            actual_cost = total_cost * provider.price_ratio
+
+                            original_cost = log.cost
+                            original_actual_cost = log.actual_cost
+
+                            # 更新记录
+                            log.prompt_tokens = usage.prompt_tokens
+                            log.completion_tokens = usage.completion_tokens
+                            log.total_tokens = usage.total_tokens
+                            log.cost = total_cost
+                            log.actual_cost = actual_cost
+                            
+                            # 更新用户余额（需要计算差额）
+                            user = session.get(User, log.user_id)
+                            if user:
+                                cost_difference = actual_cost - log.actual_cost
+                                user.balance -= cost_difference
+                                user.updated_at = datetime.now()
+                            
+                            session.commit()
+                            provider_name = data.get("provider_name") or ""
+                            print_log(f"Successfully updated usage log {usage_log_id} with actual usage at {i+1} retries. Cost: {original_cost} -> {total_cost}, Actual cost: {original_actual_cost} -> {actual_cost}, OpenRouter Provider: {provider_name}", model)
+                            return
+                    except Exception as e:
+                        print_log(f"Error updating usage log {usage_log_id}: {e}")
+                        session.rollback()
+            else:
+                print_log(f"Failed to fetch actual usage for log {usage_log_id}, user {user.name} at {i+1} retries, keeping estimated values")
+        
+        print_log(f"Failed to get actual usage for log {usage_log_id} after all retries, keeping estimated values")
 
     def compute_usage_by_tiktoken(self, model: Model, messages: list[dict], prompt: str, completion: str) -> OpenAICompletionUsage | None:
         try:
@@ -521,91 +566,55 @@ class Pipeline:
             if reasoning_content:
                 print_log(f"reasoning_content length: {len(reasoning_content)}", model, user)
 
-            if model.fetch_usage_by_api and message_id:
-                api_usage, _ = self.fetch_usage_by_api(message_id, provider)
-                usage = api_usage or usage
             is_estimate = False
-            if usage is None and model.fallback_compute_usage:
-                usage = self.compute_usage_by_tiktoken(model, messages, user_message, reasoning_content + content)
-                is_estimate = True
+            update_later = False
+            estimated_usage = None
+            if usage is None or model.fetch_usage_by_api:
+                estimated_usage = self.compute_usage_by_tiktoken(model, messages, user_message, reasoning_content + content)
+                is_estimate = usage is None
+                usage = usage or estimated_usage
 
             base_cost, actual_cost = self.compute_price(model, provider, usage)
+
+            # 创建数据库记录
+            usage_log_id = self.add_usage_log(
+                user.id, model, usage, base_cost, actual_cost, content=user_message, 
+                is_stream=is_stream, is_title_generation=is_title_generation
+            )
+
+            if model.fetch_usage_by_api and message_id:
+                # 启动后台任务获取实际使用量
+                update_later = True
+                
+                thread = threading.Thread(
+                    target=self.update_usage_in_background,
+                    args=(message_id, usage_log_id, model, provider, user)
+                )
+                thread.daemon = True
+                thread.start()
 
             if self.valves.DISPLAY_COST_AFTER_MESSAGE and display_usage_cost and not is_title_generation:
                 if last_chunk:
                     new_chunk = last_chunk.copy()
-                    new_chunk["choices"][0]["delta"]["content"] = self.generate_usage_cost_message(usage, base_cost, actual_cost, user, is_estimate)
-                    yield "data: " + json.dumps(new_chunk) + "\n\n"
+                    new_chunk["choices"][0]["delta"]["content"] = self.generate_usage_cost_message(
+                        usage, base_cost, actual_cost, user, is_estimate, update_later
+                    )
                 else:
-                    print_log("Error displaying usage cost: last_chunk is None", model, user)
+                    new_chunk = {
+                        "choices": [
+                            {
+                                "delta": {"content": self.generate_usage_cost_message(usage, base_cost, actual_cost, user, is_estimate, update_later)}
+                            }
+                        ],
+                        "finish_reason": "stop"
+                    }
+                yield "data: " + json.dumps(new_chunk) + "\n\n"
             if stop_chunk:
                 yield "data: " + json.dumps(stop_chunk) + "\n\n"
                 stop_chunk = None
             if usage_chunk:
                 yield "data: " + json.dumps(usage_chunk) + "\n\n"
                 usage_chunk = None
-            yield "data: [DONE]"
-
-            self.add_usage_log(
-                user.id, model, usage, base_cost, actual_cost, content=user_message, is_stream=is_stream, is_title_generation=is_title_generation
-            )
-
-        return generate()
-
-    def fake_stream_response(
-        self,
-        r: requests.Response,
-        model: Model,
-        provider: Provider,
-        user: User,
-        messages: list[dict],
-        user_message: str,
-        is_title_generation: bool = False,
-        display_usage_cost: bool = True,
-        is_stream: bool = True,
-    ):
-        def generate():
-            response = r.json()
-            usage = OpenAICompletionUsage(**response["usage"]) if "usage" in response else None
-            content = response["choices"][0]["message"]["content"]
-            logprobs = response["choices"][0].get("logprobs", None)
-            finish_reason = response["choices"][0].get("finish_reason", None)
-            message_id = response.get("id")
-
-            if model.fetch_usage_by_api and message_id:
-                usage, _ = self.fetch_usage_by_api(message_id, provider)
-
-            is_estimate = False
-            if usage is None and model.fallback_compute_usage:
-                usage = self.compute_usage_by_tiktoken(model, messages, user_message, content)
-                is_estimate = True
-
-            base_cost, actual_cost = self.compute_price(model, provider, usage)
-            self.add_usage_log(
-                user.id, model, usage, base_cost, actual_cost, content=user_message, is_stream=is_stream, is_title_generation=is_title_generation
-            )
-            if self.valves.DISPLAY_COST_AFTER_MESSAGE and display_usage_cost and not is_title_generation:
-                content += self.generate_usage_cost_message(usage, base_cost, actual_cost, user, is_estimate)
-
-            chunk = {
-                **response,
-                "usage": None,
-                "object": "chat.completion.chunk",
-                "choices": [{"index": 0, "delta": {"content": content}, "logprobs": None, "finish_reason": None}],
-            }
-            stop_chunk = {
-                **chunk,
-                "choices": [{"index": 0, "delta": {}, "logprobs": logprobs, "finish_reason": finish_reason}],
-            }
-            usage_chunk = {
-                **chunk,
-                "choices": None,
-                "usage": usage.model_dump(),
-            }
-
-            yield "data: " + json.dumps(chunk) + "\n\n"
-            yield "data: " + json.dumps(stop_chunk) + "\n\n"
-            yield "data: " + json.dumps(usage_chunk) + "\n\n"
             yield "data: [DONE]"
 
         return generate()
@@ -636,22 +645,25 @@ class Pipeline:
         
         message_id = response.get("id")
 
-        is_estimate = False
-
-        if model.fetch_usage_by_api and message_id:
-            usage, _ = self.fetch_usage_by_api(message_id, provider)
-            is_estimate = True
-
-        if usage is None and model.fallback_compute_usage:
-            usage = self.compute_usage_by_tiktoken(model, messages, user_message, content)
+        estimated_usage = None
+        if usage is None or model.fetch_usage_by_api:
+            estimated_usage = self.compute_usage_by_tiktoken(model, messages, user_message, content)
+            usage = usage or estimated_usage
 
         base_cost, actual_cost = self.compute_price(model, provider, usage)
-        self.add_usage_log(
-            user.id, model, usage, base_cost, actual_cost, content=user_message, is_stream=is_stream, is_title_generation=is_title_generation
+        usage_log_id = self.add_usage_log(
+            user.id, model, usage, base_cost, actual_cost, content=user_message, 
+            is_stream=is_stream, is_title_generation=is_title_generation
         )
 
-        if self.valves.DISPLAY_COST_AFTER_MESSAGE and display_usage_cost and not is_title_generation:
-            content += self.generate_usage_cost_message(usage, base_cost, actual_cost, user, is_estimate)
+        if model.fetch_usage_by_api and message_id:
+            # 启动后台任务获取实际使用量
+            thread = threading.Thread(
+                target=self.update_usage_in_background,
+                args=(message_id, usage_log_id, model, provider, user)
+            )
+            thread.daemon = True
+            thread.start()
 
         return response
 
@@ -665,39 +677,41 @@ class Pipeline:
         content: str,
         is_stream: bool = True,
         is_title_generation: bool = False,
-    ):
+    ) -> int:
         with Session(self.engine) as session:
             try:
-                with session.begin():
-                    user = session.exec(select(User).where(User.id == user_id)).first()
-                    if not user:
-                        raise Exception("User not found")
+                user = session.exec(select(User).where(User.id == user_id)).first()
+                if not user:
+                    raise Exception("User not found")
 
-                    if self.valves.RECORD_CONTENT > 0:
-                        short_content = content[: self.valves.RECORD_CONTENT]
-                        if len(content) > len(short_content):
-                            short_content += "..."
-                        content = short_content
-                    elif self.valves.RECORD_CONTENT == 0:
-                        content = None
+                if self.valves.RECORD_CONTENT > 0:
+                    short_content = content[: self.valves.RECORD_CONTENT]
+                    if len(content) > len(short_content):
+                        short_content += "..."
+                    content = short_content
+                elif self.valves.RECORD_CONTENT == 0:
+                    content = None
 
-                    usage_log = UsageLog(
-                        user_id=user.id,
-                        model=model.code,
-                        provider=model.provider,
-                        prompt_tokens=usage.prompt_tokens if usage else 0,
-                        completion_tokens=usage.completion_tokens if usage else 0,
-                        total_tokens=usage.total_tokens if usage else 0,
-                        cost=base_cost,
-                        actual_cost=actual_cost,
-                        content=content,
-                        is_stream=is_stream,
-                        is_title_generation=is_title_generation,
-                    )
-                    user.balance -= actual_cost
-                    user.updated_at = datetime.now()
-                    session.add(usage_log)
-                    session.commit()
+                usage_log = UsageLog(
+                    user_id=user.id,
+                    model=model.code,
+                    provider=model.provider,
+                    prompt_tokens=usage.prompt_tokens if usage else 0,
+                    completion_tokens=usage.completion_tokens if usage else 0,
+                    total_tokens=usage.total_tokens if usage else 0,
+                    cost=base_cost,
+                    actual_cost=actual_cost,
+                    content=content,
+                    is_stream=is_stream,
+                    is_title_generation=is_title_generation,
+                )
+                user.balance -= actual_cost
+                user.updated_at = datetime.now()
+                
+                session.add(usage_log)
+                session.commit()
+                
+                return usage_log.id
             except Exception as e:
                 print_log(f"An error occurred: {str(e)}", model, user)
                 session.rollback()
@@ -1133,7 +1147,7 @@ Your information:
             return resp
 
     def _get_recent_logs(
-        self, count: int, page: int, user_id: Optional[int] = None, model: Optional[str] = None, show_title_generation: bool = False
+        self, count: int, page: int, user_id: Optional[int] = None, model: Optional[str] = None, show_title_generation: bool = False, exclude_non_stream: bool = True
     ) -> str:
         with Session(self.pipeline.engine) as session:
             query = select(UsageLog, User.name, User.id).join(User, UsageLog.user_id == User.id)
@@ -1143,6 +1157,8 @@ Your information:
                 query = query.where(UsageLog.user_id == user_id)
             if model:
                 query = query.where(UsageLog.model.like(f"%{model}%"))
+            if exclude_non_stream:
+                query = query.where(UsageLog.is_stream == True)
             query = query.order_by(UsageLog.created_at.desc()).offset(page * count).limit(count)
 
             results = session.exec(query).all()
