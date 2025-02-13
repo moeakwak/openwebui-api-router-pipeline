@@ -2,7 +2,7 @@
 title: API Router Manifold Pipeline
 author: Moeakwak
 date: 2025-02-13
-version: 0.2.0
+version: 0.2.1
 license: MIT
 description: A pipeline for routing OpenAI models, track user usages, etc.
 requirements: tabulate
@@ -29,6 +29,7 @@ import urllib.parse
 from enum import Enum, auto
 import time
 import threading
+from http import HTTPStatus
 
 # Schemas
 
@@ -134,12 +135,14 @@ class Pipeline:
             default="$", description="The currency unit of the actual cost, also the currency unit of the user balance."
         )
         TIMEZONE: str = Field(default="UTC", description="The timezone of the server.")
+        AUXILIARY_MODEL_CODE: str = Field(default="gpt-4o-mini", description="The model to use for title generation.")
 
     class ReasoningState(Enum):
         """Enum for tracking the state of reasoning in stream response"""
+
         NOT_STARTED = auto()  # Initial state
         IN_PROGRESS = auto()  # Currently processing reasoning content
-        COMPLETED = auto()    # Finished reasoning, processing normal content
+        COMPLETED = auto()  # Finished reasoning, processing normal content
 
     def __init__(self):
         self.type = "manifold"
@@ -161,6 +164,7 @@ class Pipeline:
                 "BASE_COST_CURRENCY_UNIT": os.getenv("BASE_COST_CURRENCY_UNIT", "$"),
                 "ACTUAL_COST_CURRENCY_UNIT": os.getenv("ACTUAL_COST_CURRENCY_UNIT", "$"),
                 "TIMEZONE": os.getenv("TIMEZONE", "UTC"),
+                "AUXILIARY_MODEL_CODE": os.getenv("AUXILIARY_MODEL_CODE", "gpt-4o-mini"),
             }
         )
         self.config = self.load_config()
@@ -245,31 +249,6 @@ class Pipeline:
 
         return model, provider
 
-    async def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
-        # print_log(f"inlet:{__name__}")
-
-        if not "email" in user or not "id" in user or not "role" in user:
-            raise Exception("User info not found")
-
-        with Session(self.engine) as session:
-            db_user = session.exec(select(User).where(User.email == user["email"])).first()
-            if not db_user:
-                db_user = User(
-                    name=user.get("name"), email=user["email"], openwebui_id=user["id"], role=user["role"], balance=self.valves.DEFAULT_USER_BALANCE
-                )
-                session.add(db_user)
-                session.commit()
-            if db_user.name != user.get("name"):
-                db_user.name = user.get("name")
-                session.add(db_user)
-                session.commit()
-            if self.valves.ENABLE_BILLING and db_user.balance <= 0 and db_user.role != "admin":
-                raise Exception("Your account has insufficient balance. Please top up your account.")
-
-        body["user_info"] = db_user.model_dump()  # name, id, email, role
-
-        return body
-
     def remove_usage_cost_in_messages(self, messages: list[dict]) -> list[dict]:
         for message in messages:
             if "content" in message:
@@ -289,16 +268,12 @@ class Pipeline:
             if "content" in message:
                 if isinstance(message["content"], str):
                     # 移除 think 标签及其内容
-                    message["content"] = re.sub(r'<think>\n.*?\n</think>\n\n', '', 
-                                             message["content"], 
-                                             flags=re.DOTALL)
+                    message["content"] = re.sub(r"<think>\n.*?\n</think>\n\n", "", message["content"], flags=re.DOTALL)
                 elif isinstance(message["content"], list):
                     # 处理多模态消息
                     for content in message["content"]:
                         if isinstance(content, dict) and content.get("type") == "text":
-                            content["text"] = re.sub(r'<think>\n.*?\n</think>\n\n', '', 
-                                                  content["text"], 
-                                                  flags=re.DOTALL)
+                            content["text"] = re.sub(r"<think>\n.*?\n</think>\n\n", "", content["text"], flags=re.DOTALL)
         return messages
 
     def generate_usage_cost_message(
@@ -322,73 +297,105 @@ class Pipeline:
             print_log(f"Warning: Model has no pricing information", model)
             return 0, 0
 
-    def pipe(self, user_message: str, model_id: str, messages: list[dict], body: dict) -> Union[str, Generator, Iterator]:
-        # print_log(f"pipe:{__name__}")
-        # This is where you can add your custom pipelines like RAG.
-        # print(f"pipe:{__name__}")
-
-        if model_id == "service_bot":
-            return self.handle_bot(user_message, body["user_info"])
-
-        model, provider = self.get_model_and_provider_by_id(model_id)
-
-        user_info = body.get("user_info")
-        if not user_info:
+    def get_user_info(self, user: dict) -> User:
+        if not "email" in user or not "id" in user or not "role" in user:
             raise Exception("User info not found")
 
-        user = User(**user_info)
+        with Session(self.engine) as session:
+            db_user = session.exec(select(User).where(User.email == user["email"])).first()
+            if not db_user:
+                db_user = User(
+                    name=user.get("name"), email=user["email"], openwebui_id=user["id"], role=user["role"], balance=self.valves.DEFAULT_USER_BALANCE
+                )
+                session.add(db_user)
+                session.commit()
+            if db_user.name != user.get("name"):
+                db_user.name = user.get("name")
+                session.add(db_user)
+                session.commit()
+            if self.valves.ENABLE_BILLING and db_user.balance <= 0 and db_user.role != "admin":
+                raise Exception("Your account has insufficient balance. Please top up your account.")
+        return db_user
 
-        headers = {}
-        headers["Authorization"] = f"Bearer {provider.api_key}"
-        headers["Content-Type"] = "application/json"
-
-        payload = {
-            **body, 
-            "messages": self.remove_think_tag_in_messages(self.remove_usage_cost_in_messages(messages)), 
-            "model": model.code, 
-            "stream_options": {"include_usage": True}
-        }
-
-        if model.include_reasoning:
-            payload["include_reasoning"] = True
-
-        if model.extra_args:
-            payload = {**payload, **model.extra_args}
-
-        display_usage_cost = body.get("display_usage_cost")
-        args = {"is_title_generation": "RESPOND ONLY WITH THE TITLE" in user_message, "is_stream": body.get("stream")}
-        if display_usage_cost is not None:
-            args["display_usage_cost"] = display_usage_cost
-
-        if model.no_system_prompt:
-            payload["messages"] = [message for message in messages if message["role"] != "system"]
-
-        if "user" in payload:
-            del payload["user"]
-        if "user_info" in payload:
-            del payload["user_info"]
-        if "chat_id" in payload:
-            del payload["chat_id"]
-        if "title" in payload:
-            del payload["title"]
+    def pipe(self, user_message: str, model_id: str, messages: list[dict], body: dict) -> Union[str, Generator, Iterator]:
+        user_info = body.pop("user")
+        print("PRINT BODY", body)
 
         try:
-            r = requests.post(
-                url=f"{provider.url}/chat/completions",
-                json=payload,
-                headers=headers,
-                stream=True,
-            )
+            user = self.get_user_info(user_info)
+        except Exception as e:
+            print_log(f"Error getting user info: {e}")
+            return "Error: " + str(e)
 
-            r.raise_for_status()
+        if model_id == "service_bot":
+            return self.handle_bot(user_message, user)
 
-            if body["stream"]:
-                return self.stream_response(r, model, provider, user, messages, user_message, **args)
-            else:
-                return self.non_stream_response(r, model, provider, user, messages, user_message, **args)
+        try:
+            model, provider = self.get_model_and_provider_by_id(model_id)
+            headers = {}
+            headers["Authorization"] = f"Bearer {provider.api_key}"
+            headers["Content-Type"] = "application/json"
+
+            payload = {
+                **body,
+                "messages": self.remove_think_tag_in_messages(self.remove_usage_cost_in_messages(messages)),
+                "model": model.code,
+                "stream_options": {"include_usage": True},
+            }
+
+            if model.include_reasoning:
+                payload["include_reasoning"] = True
+
+            if model.extra_args:
+                payload = {**payload, **model.extra_args}
+
+            display_usage_cost = body.get("display_usage_cost")
+            args = {
+                "is_title_generation": "title" in user_message and model.code == self.valves.AUXILIARY_MODEL_CODE,
+                "is_stream": body.get("stream"),
+            }
+            # print("******************", args, self.valves.AUXILIARY_MODEL_CODE, model.code)
+            if display_usage_cost is not None:
+                args["display_usage_cost"] = display_usage_cost
+
+            if model.no_system_prompt:
+                payload["messages"] = [message for message in messages if message["role"] != "system"]
+
+            if "user" in payload:
+                del payload["user"]
+            if "user_info" in payload:
+                del payload["user_info"]
+            if "chat_id" in payload:
+                del payload["chat_id"]
+            if "title" in payload:
+                del payload["title"]
+            
+            print("PAYLOAD", payload)
+
+            try:
+                r = requests.post(url=f"{provider.url}/chat/completions", json=payload, headers=headers, stream=True, timeout=30)  # 添加超时设置
+
+                # 检查响应状态码
+                if r.status_code != 200:
+                    error_msg = r.text
+                    error_msg = f"Error: {r.status_code} {HTTPStatus(r.status_code).phrase} - {error_msg}"
+                    print_log(error_msg, model, user)
+                    return error_msg
+
+                if body["stream"]:
+                    return self.stream_response(r, model, provider, user, messages, user_message, **args)
+                else:
+                    return self.non_stream_response(r, model, provider, user, messages, user_message, **args)
+
+            except Exception as e:
+                error_msg = f"Error: An unexpected error occurred: {str(e)}"
+                print_log(error_msg, model, user)
+                return "Error: " + error_msg
 
         except Exception as e:
-            raise e
+            error_msg = f"Error: Unknown error occurred - {str(e)}"
+            print_log(error_msg, model, user)
+            return "Error: " + error_msg
 
     def fetch_usage_by_api(self, message_id: str, provider: Provider) -> tuple[OpenAICompletionUsage | None, float, dict]:
         headers = {
@@ -414,11 +421,11 @@ class Pipeline:
     def update_usage_in_background(self, message_id: str, usage_log_id: int, model: Model, provider: Provider, user: User):
         """后台任务：尝试获取实际使用量并更新数据库记录"""
         retry_delays = [1, 3, 5, 10]  # 重试延迟时间（秒）
-        
+
         for i, delay in enumerate(retry_delays):
             time.sleep(delay)
             usage, total_cost, data = self.fetch_usage_by_api(message_id, provider)
-            
+
             if usage:
                 with Session(self.engine) as session:
                     try:
@@ -436,24 +443,27 @@ class Pipeline:
                             log.total_tokens = usage.total_tokens
                             log.cost = total_cost
                             log.actual_cost = actual_cost
-                            
+
                             # 更新用户余额（需要计算差额）
                             user = session.get(User, log.user_id)
                             if user:
                                 cost_difference = actual_cost - log.actual_cost
                                 user.balance -= cost_difference
                                 user.updated_at = datetime.now()
-                            
+
                             session.commit()
                             provider_name = data.get("provider_name") or ""
-                            print_log(f"Successfully updated usage log {usage_log_id} with actual usage at {i+1} retries. Cost: {original_cost} -> {total_cost}, Actual cost: {original_actual_cost} -> {actual_cost}, OpenRouter Provider: {provider_name}", model)
+                            print_log(
+                                f"Successfully updated usage log {usage_log_id} with actual usage at {i+1} retries. Cost: {original_cost} -> {total_cost}, Actual cost: {original_actual_cost} -> {actual_cost}, OpenRouter Provider: {provider_name}",
+                                model,
+                            )
                             return
                     except Exception as e:
                         print_log(f"Error updating usage log {usage_log_id}: {e}")
                         session.rollback()
             else:
                 print_log(f"Failed to fetch actual usage for log {usage_log_id}, user {user.name} at {i+1} retries, keeping estimated values")
-        
+
         print_log(f"Failed to get actual usage for log {usage_log_id} after all retries, keeping estimated values")
 
     def compute_usage_by_tiktoken(self, model: Model, messages: list[dict], prompt: str, completion: str) -> OpenAICompletionUsage | None:
@@ -509,7 +519,7 @@ class Pipeline:
             stop_chunk: dict | None = None
             usage_chunk: dict | None = None
             message_id: str | None = None
-            
+
             # Initialize state machine using Enum
             reasoning_state = self.ReasoningState.NOT_STARTED
 
@@ -535,7 +545,7 @@ class Pipeline:
                     delta = chunk["choices"][0].get("delta", {})
                     content_delta = delta.get("content") or ""
                     reasoning_delta = delta.get("reasoning_content") or delta.get("reasoning") or ""
-                    
+
                     # Handle reasoning state transitions using Enum
                     if reasoning_state == self.ReasoningState.NOT_STARTED and reasoning_delta:
                         reasoning_state = self.ReasoningState.IN_PROGRESS
@@ -562,7 +572,7 @@ class Pipeline:
                 elif "usage" in chunk:
                     usage = OpenAICompletionUsage(**chunk["usage"])
                     usage_chunk = chunk
-            
+
             if reasoning_content:
                 print_log(f"reasoning_content length: {len(reasoning_content)}", model, user)
 
@@ -578,18 +588,14 @@ class Pipeline:
 
             # 创建数据库记录
             usage_log_id = self.add_usage_log(
-                user.id, model, usage, base_cost, actual_cost, content=user_message, 
-                is_stream=is_stream, is_title_generation=is_title_generation
+                user.id, model, usage, base_cost, actual_cost, content=user_message, is_stream=is_stream, is_title_generation=is_title_generation
             )
 
             if model.fetch_usage_by_api and message_id:
                 # 启动后台任务获取实际使用量
                 update_later = True
-                
-                thread = threading.Thread(
-                    target=self.update_usage_in_background,
-                    args=(message_id, usage_log_id, model, provider, user)
-                )
+
+                thread = threading.Thread(target=self.update_usage_in_background, args=(message_id, usage_log_id, model, provider, user))
                 thread.daemon = True
                 thread.start()
 
@@ -602,11 +608,9 @@ class Pipeline:
                 else:
                     new_chunk = {
                         "choices": [
-                            {
-                                "delta": {"content": self.generate_usage_cost_message(usage, base_cost, actual_cost, user, is_estimate, update_later)}
-                            }
+                            {"delta": {"content": self.generate_usage_cost_message(usage, base_cost, actual_cost, user, is_estimate, update_later)}}
                         ],
-                        "finish_reason": "stop"
+                        "finish_reason": "stop",
                     }
                 yield "data: " + json.dumps(new_chunk) + "\n\n"
             if stop_chunk:
@@ -631,18 +635,22 @@ class Pipeline:
         display_usage_cost: bool = False,
         is_stream: bool = True,
     ):
+        # print("****************** non_stream_response", {
+        #     "is_title_generation": is_title_generation,
+        #     "is_stream": is_stream,
+        # })
         response = r.json()
         usage = OpenAICompletionUsage(**response["usage"]) if "usage" in response else None
-        
+
         # 处理 reasoning content
         message = response["choices"][0]["message"]
         content = message["content"]
         reasoning = message.get("reasoning_content") or message.get("reasoning")
-        
+
         if reasoning:
             content = f"<think>\n{reasoning}\n</think>\n\n{content}"
             message["content"] = content
-        
+
         message_id = response.get("id")
 
         estimated_usage = None
@@ -652,16 +660,12 @@ class Pipeline:
 
         base_cost, actual_cost = self.compute_price(model, provider, usage)
         usage_log_id = self.add_usage_log(
-            user.id, model, usage, base_cost, actual_cost, content=user_message, 
-            is_stream=is_stream, is_title_generation=is_title_generation
+            user.id, model, usage, base_cost, actual_cost, content=user_message, is_stream=is_stream, is_title_generation=is_title_generation
         )
 
         if model.fetch_usage_by_api and message_id:
             # 启动后台任务获取实际使用量
-            thread = threading.Thread(
-                target=self.update_usage_in_background,
-                args=(message_id, usage_log_id, model, provider, user)
-            )
+            thread = threading.Thread(target=self.update_usage_in_background, args=(message_id, usage_log_id, model, provider, user))
             thread.daemon = True
             thread.start()
 
@@ -678,6 +682,18 @@ class Pipeline:
         is_stream: bool = True,
         is_title_generation: bool = False,
     ) -> int:
+        # print(
+        #     "****************** add_usage_log",
+        #     {
+        #         "user_id": user_id,
+        #         "model": model.code,
+        #         "usage": usage,
+        #         "base_cost": base_cost,
+        #         "actual_cost": actual_cost,
+        #         "is_stream": is_stream,
+        #         "is_title_generation": is_title_generation,
+        #     },
+        # )
         with Session(self.engine) as session:
             try:
                 user = session.exec(select(User).where(User.id == user_id)).first()
@@ -707,17 +723,17 @@ class Pipeline:
                 )
                 user.balance -= actual_cost
                 user.updated_at = datetime.now()
-                
+
                 session.add(usage_log)
                 session.commit()
-                
+
                 return usage_log.id
             except Exception as e:
                 print_log(f"An error occurred: {str(e)}", model, user)
                 session.rollback()
                 raise
 
-    def handle_bot(self, message: str, user: dict):
+    def handle_bot(self, message: str, user: User):
         bot = ServiceBot(self)
         return bot.handle_command(message, user)
 
@@ -731,6 +747,7 @@ def add_user_parsers(subparsers: argparse._SubParsersAction) -> dict[str, argpar
     recent_parser: argparse.ArgumentParser = subparsers.add_parser("recent", help="Show recent usage logs")
     recent_parser.add_argument("-c", "--count", type=int, default=20, help="Number of logs to show")
     recent_parser.add_argument("-p", "--page", type=int, default=0, help="Page number")
+    recent_parser.add_argument("-a", "--all", action="store_true", help="Show all logs (including title generation)")
 
     # Models command
     models_parser: argparse.ArgumentParser = subparsers.add_parser("models", help="Show all models and their prices")
@@ -783,6 +800,7 @@ def get_admin_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     grecent_parser.add_argument("-p", "--page", type=int, default=0, help="Page number")
     grecent_parser.add_argument("-m", "--model", type=str, default=None, help="Filter by model")
     grecent_parser.add_argument("-u", "--user", type=str, default=None, help="Filter by user id")
+    grecent_parser.add_argument("-a", "--all", action="store_true", help="Show all logs (including title generation)")
 
     list_users_parser = subparsers.add_parser("users", help="List all users")
 
@@ -819,8 +837,8 @@ class ServiceBot:
             "grecent": self.grecent,
         }
 
-    def handle_command(self, message: str, user: dict) -> str:
-        is_admin = user["role"] == "admin"
+    def handle_command(self, message: str, user: User) -> str:
+        is_admin = user.role == "admin"
         parser, added_parsers_map = get_admin_parser() if is_admin else get_user_parser()
         help_text = f"```\n{clean_usage(parser.format_help())}\n```\n\nType `help <command>` for more information about a command."
 
@@ -829,7 +847,7 @@ class ServiceBot:
         except SystemExit:
             return "Invalid command.\n\n" + help_text
         except Exception as e:
-            print_log(f"Error parsing command: {e}" )
+            print_log(f"Error parsing command: {e}")
             return "Invalid command.\n\n" + help_text
 
         if not args.command:
@@ -854,19 +872,19 @@ class ServiceBot:
         return result
 
     # Update the command methods to use the new args format
-    def stats(self, args: argparse.Namespace, user: dict) -> str:
-        return self._get_model_stats(args.period, user["id"])
+    def stats(self, args: argparse.Namespace, user: User) -> str:
+        return self._get_model_stats(args.period, user.id)
 
-    def gstats(self, args: argparse.Namespace, user: dict) -> str:
+    def gstats(self, args: argparse.Namespace, user: User) -> str:
         return self._get_model_stats(args.period) + "\n\n" + self._get_user_stats(args.period, args.model)
 
-    def recent(self, args: argparse.Namespace, user: dict) -> str:
-        return self._get_recent_logs(args.count, args.page, user["id"])
+    def recent(self, args: argparse.Namespace, user: User) -> str:
+        return self._get_recent_logs(args.count, args.page, user.id, show_title_generation=args.all, filter_auxiliary_model=not args.all)
 
-    def grecent(self, args: argparse.Namespace, user: dict) -> str:
-        return self._get_recent_logs(args.count, args.page, args.user, args.model)
+    def grecent(self, args: argparse.Namespace, user: User) -> str:
+        return self._get_recent_logs(args.count, args.page, args.user, args.model, show_title_generation=args.all, filter_auxiliary_model=not args.all)
 
-    def topup(self, args: argparse.Namespace, user: dict) -> str:
+    def topup(self, args: argparse.Namespace, user: User) -> str:
         with Session(self.pipeline.engine) as session:
             db_user = session.exec(select(User).where((User.id == args.user) | (User.email == args.user))).first()
             if not db_user:
@@ -876,7 +894,7 @@ class ServiceBot:
             session.commit()
             return f"Successfully topped up {db_user.email}'s balance by {self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{args.amount:.2f}. New balance: {self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{db_user.balance:.2f}"
 
-    def set_balance(self, args: argparse.Namespace, user: dict) -> str:
+    def set_balance(self, args: argparse.Namespace, user: User) -> str:
         with Session(self.pipeline.engine) as session:
             db_user = session.exec(select(User).where((User.id == args.user) | (User.email == args.user))).first()
             if not db_user:
@@ -886,7 +904,7 @@ class ServiceBot:
             session.commit()
             return f"Successfully set {db_user.email}'s balance to {self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{args.amount:.2f}"
 
-    def models(self, args: argparse.Namespace, user: dict) -> str:
+    def models(self, args: argparse.Namespace, user: User) -> str:
         price_ratio_map = {}
         for provider in self.pipeline.config.providers:
             price_ratio_map[provider.key] = provider.price_ratio
@@ -942,22 +960,18 @@ class ServiceBot:
 
         return f"{tabulate(data, headers=headers, tablefmt='pipe', colalign=('left',))}"
 
-    def me(self, args: argparse.Namespace, user: dict) -> str:
-        with Session(self.pipeline.engine) as session:
-            db_user = session.exec(select(User).where(User.email == user["email"])).first()
-            if not db_user:
-                return "User not found."
-            return f"""
+    def me(self, args: argparse.Namespace, user: User) -> str:
+        return f"""
 Your information:
-- ID: {db_user.id}
-- Email: {db_user.email}
-- Name: {db_user.name or 'N/A'}
-- Balance: {self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{db_user.balance:.6f}
-- Role: {db_user.role}
-- Created at: {db_user.created_at}
+- ID: {user.id}
+- Email: {user.email}
+- Name: {user.name or 'N/A'}
+- Balance: {self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{user.balance:.6f}
+- Role: {user.role}
+- Created at: {user.created_at}
 """.strip()
 
-    def users(self, args: argparse.Namespace, user: dict) -> str:
+    def users(self, args: argparse.Namespace, user: User) -> str:
         with Session(self.pipeline.engine) as session:
             users = session.exec(select(User)).all()
             headers = ["ID", "Name", "Email", "Balance", "Role", "Updated At", "Created At"]
@@ -1147,8 +1161,27 @@ Your information:
             return resp
 
     def _get_recent_logs(
-        self, count: int, page: int, user_id: Optional[int] = None, model: Optional[str] = None, show_title_generation: bool = False, exclude_non_stream: bool = True
+        self,
+        count: int,
+        page: int,
+        user_id: Optional[int] = None,
+        model: Optional[str] = None,
+        show_title_generation: bool = False,
+        exclude_non_stream: bool = False,
+        filter_auxiliary_model: bool = True,
     ) -> str:
+        # print(
+        #     "****************** _get_recent_logs",
+        #     {
+        #         "count": count,
+        #         "page": page,
+        #         "user_id": user_id,
+        #         "model": model,
+        #         "show_title_generation": show_title_generation,
+        #         "exclude_non_stream": exclude_non_stream,
+        #         "filter_auxiliary_model": filter_auxiliary_model,
+        #     },
+        # )
         with Session(self.pipeline.engine) as session:
             query = select(UsageLog, User.name, User.id).join(User, UsageLog.user_id == User.id)
             if not show_title_generation:
@@ -1159,6 +1192,9 @@ Your information:
                 query = query.where(UsageLog.model.like(f"%{model}%"))
             if exclude_non_stream:
                 query = query.where(UsageLog.is_stream == True)
+            if filter_auxiliary_model:
+                query = query.where(UsageLog.model.not_like(f"%{self.pipeline.valves.AUXILIARY_MODEL_CODE}%"))
+
             query = query.order_by(UsageLog.created_at.desc()).offset(page * count).limit(count)
 
             results = session.exec(query).all()
@@ -1166,9 +1202,11 @@ Your information:
             if not results:
                 return "No recent usage logs found."
 
-            headers = ["Time", "Provider", "Model", "Tokens", "Cost", "Content", "Stream"]
+            headers = ["Time", "Provider", "Model", "Tokens", "Base Cost", "Actual Cost", "Content", "Stream"]
             if not user_id:
                 headers.insert(1, "User")
+            if show_title_generation:
+                headers.append("Title Generation")
 
             data = []
             for r in results:
@@ -1182,12 +1220,15 @@ Your information:
                     r.UsageLog.provider,
                     r.UsageLog.model,
                     r.UsageLog.total_tokens,
+                    f"{self.pipeline.valves.BASE_COST_CURRENCY_UNIT}{r.UsageLog.cost:.6f}",
                     f"{self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{r.UsageLog.actual_cost:.6f}",
                     content,
                     r.UsageLog.is_stream,
                 ]
                 if not user_id:
                     row.insert(1, f"{r.name or 'N/A'} (ID: {r.id})")
+                if show_title_generation:
+                    row.append(r.UsageLog.is_title_generation)
                 data.append(row)
 
             table = tabulate(data, headers=headers, tablefmt="pipe", colalign=("left",))
