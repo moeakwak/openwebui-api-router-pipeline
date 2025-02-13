@@ -1,11 +1,11 @@
 """
 title: API Router Manifold Pipeline
 author: Moeakwak
-date: 2025-02-06
-version: 0.1.6
+date: 2025-02-13
+version: 0.1.7
 license: MIT
 description: A pipeline for routing OpenAI models, track user usages, etc.
-requirements: sqlmodel, sqlalchemy, requests, pathlib, tabulate
+requirements: sqlmodel, tabulate
 """
 
 import json
@@ -108,6 +108,15 @@ def escape_model_code(code: str):
     return code.replace("/", "__")
 
 
+def print_log(message: str, model: Optional[Model] = None, user: Optional[User] = None):
+    prefix = f"Router Pipeline | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    if model:
+        prefix += f" [{model.code} {model.provider}]"
+    if user:
+        prefix += f" ({user.name})"
+    print(f"{prefix} | {message}")
+
+
 class Pipeline:
     class Valves(BaseModel):
         MODELS_CONFIG_YAML_PATH: str = "/app/pipelines/api_router.yaml"
@@ -183,7 +192,7 @@ class Pipeline:
     def load_config(self):
         try:
             path = Path(self.valves.MODELS_CONFIG_YAML_PATH)
-            print(f"Loading config from {path.absolute()}")
+            print_log(f"Loading config from {path.absolute()}")
             if not path.exists():
                 raise FileNotFoundError(f"Config file not found: {path}")
 
@@ -191,7 +200,7 @@ class Pipeline:
                 data = yaml.load(f, Loader=yaml.FullLoader)
             return Config.model_validate(data)
         except Exception as e:
-            print(f"Error loading config: {e}")
+            print_log(f"Error loading config: {e}")
             return Config(providers=[])
 
     def load_models(self) -> dict[str, Model]:
@@ -199,12 +208,12 @@ class Pipeline:
         provider_keys = {p.key for p in self.config.providers}
 
         if not self.config.models:
-            print("No models found in config.yaml")
+            print_log("No models found in config.yaml")
             return models
 
         for model in self.config.models:
             if model.provider not in provider_keys:
-                print(f"Provider {model.provider} not found in config.yaml")
+                print_log(f"Provider {model.provider} not found in config.yaml")
                 continue
             if model.prompt_price or model.completion_price:
                 if model.prompt_price is None or model.completion_price is None:
@@ -235,7 +244,7 @@ class Pipeline:
         return model, provider
 
     async def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
-        # print(f"inlet:{__name__}")
+        # print_log(f"inlet:{__name__}")
 
         if not "email" in user or not "id" in user or not "role" in user:
             raise Exception("User info not found")
@@ -305,10 +314,11 @@ class Pipeline:
         elif model.per_message_price:
             return model.per_message_price, model.per_message_price * provider.price_ratio
         else:
-            print(f"Warning: Model {model.code} has no pricing information")
+            print_log(f"Warning: Model has no pricing information", model)
             return 0, 0
 
     def pipe(self, user_message: str, model_id: str, messages: list[dict], body: dict) -> Union[str, Generator, Iterator]:
+        # print_log(f"pipe:{__name__}")
         # This is where you can add your custom pipelines like RAG.
         # print(f"pipe:{__name__}")
 
@@ -398,7 +408,7 @@ class Pipeline:
             usage = OpenAICompletionUsage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, total_tokens=total_tokens)
             return usage, total_cost
         else:
-            print(f"Failed to fetch usage by API: {generation_response.status_code} {generation_response.text}")
+            print_log(f"Failed to fetch usage by API: {generation_response.status_code} {generation_response.text}")
             return None, 0
 
     def compute_usage_by_tiktoken(self, model: Model, messages: list[dict], prompt: str, completion: str) -> OpenAICompletionUsage | None:
@@ -428,9 +438,10 @@ class Pipeline:
             prompt_tokens = len(encoding.encode(prompt)) + messages_tokens
             completion_tokens = len(encoding.encode(completion))
             total_tokens = prompt_tokens + completion_tokens
+            print_log(f"prompt_tokens: {prompt_tokens}, completion_tokens: {completion_tokens}, total_tokens: {total_tokens}", model)
             return OpenAICompletionUsage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, total_tokens=total_tokens)
         except Exception as e:
-            print(f"Error computing usage by tiktoken: {e}")
+            print_log(f"Error computing usage by tiktoken: {e}", model)
             return None
 
     def stream_response(
@@ -472,7 +483,7 @@ class Pipeline:
                 try:
                     chunk = json.loads(line)
                 except json.JSONDecodeError:
-                    print(f"Error decoding JSON: {line}")
+                    print_log(f"Error decoding JSON: {line}", model.code, user.name)
                     continue
 
                 if "choices" in chunk and len(chunk["choices"]) > 0:
@@ -507,10 +518,12 @@ class Pipeline:
                     usage = OpenAICompletionUsage(**chunk["usage"])
                     usage_chunk = chunk
             
-            # print(f"{model.code} reasoning_content: {reasoning_content}")
+            if reasoning_content:
+                print_log(f"reasoning_content length: {len(reasoning_content)}", model, user)
 
             if model.fetch_usage_by_api and message_id:
-                usage, _ = self.fetch_usage_by_api(message_id, provider)
+                api_usage, _ = self.fetch_usage_by_api(message_id, provider)
+                usage = api_usage or usage
             is_estimate = False
             if usage is None and model.fallback_compute_usage:
                 usage = self.compute_usage_by_tiktoken(model, messages, user_message, reasoning_content + content)
@@ -524,7 +537,7 @@ class Pipeline:
                     new_chunk["choices"][0]["delta"]["content"] = self.generate_usage_cost_message(usage, base_cost, actual_cost, user, is_estimate)
                     yield "data: " + json.dumps(new_chunk) + "\n\n"
                 else:
-                    print("Error displaying usage cost: last_chunk is None")
+                    print_log("Error displaying usage cost: last_chunk is None", model, user)
             if stop_chunk:
                 yield "data: " + json.dumps(stop_chunk) + "\n\n"
                 stop_chunk = None
@@ -686,7 +699,7 @@ class Pipeline:
                     session.add(usage_log)
                     session.commit()
             except Exception as e:
-                print(f"An error occurred: {str(e)}")
+                print_log(f"An error occurred: {str(e)}", model, user)
                 session.rollback()
                 raise
 
@@ -802,7 +815,7 @@ class ServiceBot:
         except SystemExit:
             return "Invalid command.\n\n" + help_text
         except Exception as e:
-            print(e)
+            print_log(f"Error parsing command: {e}" )
             return "Invalid command.\n\n" + help_text
 
         if not args.command:
