@@ -2,7 +2,7 @@
 title: API Router Manifold Pipeline
 author: Moeakwak
 date: 2025-02-13
-version: 0.2.1
+version: 0.2.2
 license: MIT
 description: A pipeline for routing OpenAI models, track user usages, etc.
 requirements: tabulate
@@ -120,6 +120,7 @@ def print_log(message: str, model: Optional[Model] = None, user: Optional[User] 
     print(f"{prefix} | {message}")
 
 
+
 class Pipeline:
     class Valves(BaseModel):
         MODELS_CONFIG_YAML_PATH: str = "/app/pipelines/api_router.yaml"
@@ -136,6 +137,7 @@ class Pipeline:
         )
         TIMEZONE: str = Field(default="UTC", description="The timezone of the server.")
         AUXILIARY_MODEL_CODE: str = Field(default="gpt-4o-mini", description="The model to use for title generation.")
+        DEBUG_MODE: bool = Field(default=False, description="If true, enable debug mode.")
 
     class ReasoningState(Enum):
         """Enum for tracking the state of reasoning in stream response"""
@@ -143,6 +145,11 @@ class Pipeline:
         NOT_STARTED = auto()  # Initial state
         IN_PROGRESS = auto()  # Currently processing reasoning content
         COMPLETED = auto()  # Finished reasoning, processing normal content
+    
+
+    def print_debug(self, message: str):
+        if self.valves.DEBUG_MODE:
+            print(f"***** DEBUG | {message}")
 
     def __init__(self):
         self.type = "manifold"
@@ -165,6 +172,7 @@ class Pipeline:
                 "ACTUAL_COST_CURRENCY_UNIT": os.getenv("ACTUAL_COST_CURRENCY_UNIT", "$"),
                 "TIMEZONE": os.getenv("TIMEZONE", "UTC"),
                 "AUXILIARY_MODEL_CODE": os.getenv("AUXILIARY_MODEL_CODE", "gpt-4o-mini"),
+                "DEBUG_MODE": True if os.getenv("DEBUG_MODE", "false").lower() == "true" else False,
             }
         )
         self.config = self.load_config()
@@ -259,7 +267,7 @@ class Pipeline:
                         if isinstance(content, dict) and "text" in content:
                             content["text"] = re.sub(r"\n*\*\(📊[^)]*\)\*$", "", content["text"], flags=re.MULTILINE)
             else:
-                print(f"Unknown message type: {message}")
+                self.print_debug(f"Unknown message type: {message}")
         return messages
 
     def remove_think_tag_in_messages(self, messages: list[dict]) -> list[dict]:
@@ -319,7 +327,7 @@ class Pipeline:
 
     def pipe(self, user_message: str, model_id: str, messages: list[dict], body: dict) -> Union[str, Generator, Iterator]:
         user_info = body.pop("user")
-        print("PRINT BODY", body)
+        self.print_debug(f"PRINT BODY: {body}")
 
         try:
             user = self.get_user_info(user_info)
@@ -354,7 +362,6 @@ class Pipeline:
                 "is_title_generation": "title" in user_message and model.code == self.valves.AUXILIARY_MODEL_CODE,
                 "is_stream": body.get("stream"),
             }
-            # print("******************", args, self.valves.AUXILIARY_MODEL_CODE, model.code)
             if display_usage_cost is not None:
                 args["display_usage_cost"] = display_usage_cost
 
@@ -370,7 +377,7 @@ class Pipeline:
             if "title" in payload:
                 del payload["title"]
             
-            print("PAYLOAD", payload)
+            self.print_debug(f"PAYLOAD: {payload}")
 
             try:
                 r = requests.post(url=f"{provider.url}/chat/completions", json=payload, headers=headers, stream=True, timeout=30)  # 添加超时设置
@@ -635,10 +642,6 @@ class Pipeline:
         display_usage_cost: bool = False,
         is_stream: bool = True,
     ):
-        # print("****************** non_stream_response", {
-        #     "is_title_generation": is_title_generation,
-        #     "is_stream": is_stream,
-        # })
         response = r.json()
         usage = OpenAICompletionUsage(**response["usage"]) if "usage" in response else None
 
@@ -1034,8 +1037,6 @@ Your information:
 
             results = session.exec(query).all()
 
-            print(results[0])
-
             if not results:
                 return "No usage records found for the specified time period."
 
@@ -1211,10 +1212,12 @@ Your information:
             data = []
             for r in results:
                 content = r.UsageLog.content[:20] if r.UsageLog.content else "-"
+                content = content.replace("<think>", "").replace("</think>", "")
                 if len(r.UsageLog.content) > 20:
                     content += "..."
                 content = content.replace("\n", "\\n")
                 content = content.replace("\r", "\\r")
+                content = f"`{content}`"
                 row = [
                     r.UsageLog.created_at.astimezone(pytz.timezone(self.pipeline.valves.TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S"),
                     r.UsageLog.provider,
