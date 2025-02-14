@@ -25,7 +25,6 @@ from sqlalchemy import func
 from typing import Optional
 import tiktoken
 import argparse
-import urllib.parse
 from enum import Enum, auto
 import time
 import threading
@@ -41,6 +40,7 @@ class Model(BaseModel):
     prompt_price: Optional[float] = Field(default=None, description="The prompt price of the model per 1M tokens.")
     completion_price: Optional[float] = Field(default=None, description="The completion price of the model per 1M tokens.")
     per_message_price: Optional[float] = Field(default=None, description="The price of the model per message.")
+    disable_cost_display_in_completion: Optional[bool] = Field(default=False, description="If true, disable showing the cost in the completion. Useful for reasoning models.")
     no_system_prompt: Optional[bool] = Field(default=False, description="If true, remove the system prompt. Useful for o1 models.")
     no_stream: Optional[bool] = Field(default=False, description="If true, do not stream the response. Useful for o1 models.")
     fetch_usage_by_api: Optional[bool] = Field(
@@ -119,6 +119,9 @@ def print_log(message: str, model: Optional[Model] = None, user: Optional[User] 
         prefix += f" ({user.name})"
     print(f"{prefix} | {message}")
 
+def print_and_raise(message: str):
+    print(f"***** ERROR | {message}")
+    raise Exception(message)
 
 
 class Pipeline:
@@ -130,7 +133,6 @@ class Pipeline:
             default=30, description="Record the first N characters of the content. Set to 0 to disable recording content, -1 to record all content."
         )
         DEFAULT_USER_BALANCE: float = Field(default=10, description="Default balance of the user in USD.")
-        DISPLAY_COST_AFTER_MESSAGE: bool = Field(default=True, description="If true, display the cost of the usage after the message.")
         BASE_COST_CURRENCY_UNIT: str = Field(default="$", description="The currency unit of the base cost.")
         ACTUAL_COST_CURRENCY_UNIT: str = Field(
             default="$", description="The currency unit of the actual cost, also the currency unit of the user balance."
@@ -167,7 +169,6 @@ class Pipeline:
                 "DATABASE_URL": os.getenv("DATABASE_URL", "sqlite:////app/pipelines/api_router.db"),
                 "RECORD_CONTENT": int(os.getenv("RECORD_CONTENT", 30)),
                 "DEFAULT_USER_BALANCE": float(os.getenv("DEFAULT_USER_BALANCE", 10)),
-                "DISPLAY_COST_AFTER_MESSAGE": True if os.getenv("DISPLAY_COST_AFTER_MESSAGE", "true").lower() == "true" else False,
                 "BASE_COST_CURRENCY_UNIT": os.getenv("BASE_COST_CURRENCY_UNIT", "$"),
                 "ACTUAL_COST_CURRENCY_UNIT": os.getenv("ACTUAL_COST_CURRENCY_UNIT", "$"),
                 "TIMEZONE": os.getenv("TIMEZONE", "UTC"),
@@ -231,10 +232,10 @@ class Pipeline:
                 continue
             if model.prompt_price or model.completion_price:
                 if model.prompt_price is None or model.completion_price is None:
-                    raise Exception(f"Prompt price and completion price must be set for model {model.code}")
+                    print_and_raise(f"Prompt price and completion price must be set for model {model.code}")
             elif model.per_message_price:
                 if model.per_message_price is None:
-                    raise Exception(f"Per message price must be set for model {model.code}")
+                    print_and_raise(f"Per message price must be set for model {model.code}")
             else:
                 raise Exception(f"Model {model.code} must have either prompt price, completion price, or per message price set.")
             models[f"{model.provider}_{escape_model_code(model.code)}"] = model
@@ -249,11 +250,11 @@ class Pipeline:
     def get_model_and_provider_by_id(self, model_id: str) -> tuple[Model, Provider]:
         model = self.models.get(model_id)
         if not model:
-            raise Exception(f"Model {model_id} not found")
+            print_and_raise(f"Model {model_id} not found")
 
         provider = next((p for p in self.config.providers if p.key == model.provider), None)
         if not provider:
-            raise Exception(f"Provider {model.provider} not found in config.yaml")
+            print_and_raise(f"Provider {model.provider} not found in config.yaml")
 
         return model, provider
 
@@ -276,12 +277,12 @@ class Pipeline:
             if "content" in message:
                 if isinstance(message["content"], str):
                     # 移除 think 标签及其内容
-                    message["content"] = re.sub(r"<think>\n.*?\n</think>\n\n", "", message["content"], flags=re.DOTALL)
+                    message["content"] = re.sub(r"<think>\n+.*?\n+</think>\n+", "", message["content"], flags=re.DOTALL).strip()
                 elif isinstance(message["content"], list):
                     # 处理多模态消息
                     for content in message["content"]:
                         if isinstance(content, dict) and content.get("type") == "text":
-                            content["text"] = re.sub(r"<think>\n.*?\n</think>\n\n", "", content["text"], flags=re.DOTALL)
+                            content["text"] = re.sub(r"<think>\n+.*?\n+</think>\n+", "", content["text"], flags=re.DOTALL).strip()
         return messages
 
     def generate_usage_cost_message(
@@ -606,7 +607,7 @@ class Pipeline:
                 thread.daemon = True
                 thread.start()
 
-            if self.valves.DISPLAY_COST_AFTER_MESSAGE and display_usage_cost and not is_title_generation:
+            if not model.disable_cost_display_in_completion and display_usage_cost and not is_title_generation:
                 if last_chunk:
                     new_chunk = last_chunk.copy()
                     new_chunk["choices"][0]["delta"]["content"] = self.generate_usage_cost_message(
@@ -671,6 +672,11 @@ class Pipeline:
             thread = threading.Thread(target=self.update_usage_in_background, args=(message_id, usage_log_id, model, provider, user))
             thread.daemon = True
             thread.start()
+
+        # non stream response should not show cost in completion
+
+        # if model.show_cost_in_completion and display_usage_cost and not is_title_generation:
+        #     message["content"] += self.generate_usage_cost_message(usage, base_cost, actual_cost, user, usage is None, model.fetch_usage_by_api)
 
         return response
 
