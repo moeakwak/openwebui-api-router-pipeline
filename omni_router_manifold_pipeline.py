@@ -1,5 +1,5 @@
 """
-title: API Router Manifold Pipeline
+title: Omni Router Manifold Pipeline
 author: Moeakwak
 date: 2025-02-13
 version: 0.2.2
@@ -108,7 +108,7 @@ class UsageLog(SQLModel, table=True):
 
 
 def escape_model_code(code: str):
-    return code.replace("/", "__")
+    return code.replace("/", "__").replace(":", "___")
 
 
 def print_log(message: str, model: Optional[Model] = None, user: Optional[User] = None):
@@ -126,8 +126,8 @@ def print_and_raise(message: str):
 
 class Pipeline:
     class Valves(BaseModel):
-        MODELS_CONFIG_YAML_PATH: str = "/app/pipelines/api_router.yaml"
-        DATABASE_URL: str = "sqlite:////app/pipelines/api_router.db"
+        MODELS_CONFIG_YAML_PATH: str = "/app/pipelines/omni_router.yaml"
+        DATABASE_URL: str = "sqlite:////app/pipelines/omni_router.db"
         ENABLE_BILLING: bool = True
         RECORD_CONTENT: int = Field(
             default=30, description="Record the first N characters of the content. Set to 0 to disable recording content, -1 to record all content."
@@ -159,14 +159,14 @@ class Pipeline:
         # Best practice is to not specify the id so that it can be automatically inferred from the filename, so that users can install multiple versions of the same pipeline.
         # The identifier must be unique across all pipelines.
         # The identifier must be an alphanumeric string that can include underscores or hyphens. It cannot contain spaces, special characters, slashes, or backslashes.
-        self.id = "api_router"
+        self.id = "omni_router"
         self.name = "💬 "
 
         self.valves = self.Valves(
             **{
-                "MODELS_CONFIG_YAML_PATH": os.getenv("MODELS_CONFIG_YAML_PATH", "/app/pipelines/api_router.yaml"),
+                "MODELS_CONFIG_YAML_PATH": os.getenv("MODELS_CONFIG_YAML_PATH", "/app/pipelines/omni_router.yaml"),
                 "ENABLE_BILLING": True if os.getenv("ENABLE_BILLING", "true").lower() == "true" else False,
-                "DATABASE_URL": os.getenv("DATABASE_URL", "sqlite:////app/pipelines/api_router.db"),
+                "DATABASE_URL": os.getenv("DATABASE_URL", "sqlite:////app/pipelines/omni_router.db"),
                 "RECORD_CONTENT": int(os.getenv("RECORD_CONTENT", 30)),
                 "DEFAULT_USER_BALANCE": float(os.getenv("DEFAULT_USER_BALANCE", 10)),
                 "BASE_COST_CURRENCY_UNIT": os.getenv("BASE_COST_CURRENCY_UNIT", "$"),
@@ -230,21 +230,19 @@ class Pipeline:
             if model.provider not in provider_keys:
                 print_log(f"Provider {model.provider} not found in config.yaml")
                 continue
-            if model.prompt_price or model.completion_price:
-                if model.prompt_price is None or model.completion_price is None:
-                    print_and_raise(f"Prompt price and completion price must be set for model {model.code}")
-            elif model.per_message_price:
-                if model.per_message_price is None:
-                    print_and_raise(f"Per message price must be set for model {model.code}")
-            else:
-                raise Exception(f"Model {model.code} must have either prompt price, completion price, or per message price set.")
+            has_prompt_price = model.prompt_price is not None
+            has_completion_price = model.completion_price is not None
+            if has_prompt_price != has_completion_price:
+                print_and_raise(f"Model {model.code} must have both prompt price and completion price set, or neither")
+            elif not has_prompt_price and model.per_message_price is None:
+                print_and_raise(f"Model {model.code} must have either (prompt price + completion price) or per message price set")
             models[f"{model.provider}_{escape_model_code(model.code)}"] = model
 
         return models
 
     def get_pipelines(self) -> list[dict]:
         pipelines = [{"id": model_id, "name": model.human_name or model.code} for model_id, model in self.models.items()]
-        pipelines.append({"id": "service_bot", "name": "AAA 🤖 Service Bot"})
+        pipelines.insert(0, {"id": "service_bot", "name": "🤖 Service Bot"})
         return pipelines
 
     def get_model_and_provider_by_id(self, model_id: str) -> tuple[Model, Provider]:
@@ -691,18 +689,6 @@ class Pipeline:
         is_stream: bool = True,
         is_title_generation: bool = False,
     ) -> int:
-        # print(
-        #     "****************** add_usage_log",
-        #     {
-        #         "user_id": user_id,
-        #         "model": model.code,
-        #         "usage": usage,
-        #         "base_cost": base_cost,
-        #         "actual_cost": actual_cost,
-        #         "is_stream": is_stream,
-        #         "is_title_generation": is_title_generation,
-        #     },
-        # )
         with Session(self.engine) as session:
             try:
                 user = session.exec(select(User).where(User.id == user_id)).first()
@@ -1177,18 +1163,6 @@ Your information:
         exclude_non_stream: bool = False,
         filter_auxiliary_model: bool = True,
     ) -> str:
-        # print(
-        #     "****************** _get_recent_logs",
-        #     {
-        #         "count": count,
-        #         "page": page,
-        #         "user_id": user_id,
-        #         "model": model,
-        #         "show_title_generation": show_title_generation,
-        #         "exclude_non_stream": exclude_non_stream,
-        #         "filter_auxiliary_model": filter_auxiliary_model,
-        #     },
-        # )
         with Session(self.pipeline.engine) as session:
             query = select(UsageLog, User.name, User.id).join(User, UsageLog.user_id == User.id)
             if not show_title_generation:
