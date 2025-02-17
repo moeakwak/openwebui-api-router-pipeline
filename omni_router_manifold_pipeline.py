@@ -2,7 +2,7 @@
 title: Omni Router Manifold Pipeline
 author: Moeakwak
 date: 2025-02-13
-version: 0.2.2
+version: 0.2.3
 license: MIT
 description: A pipeline for routing OpenAI models, track user usages, etc.
 requirements: tabulate
@@ -40,19 +40,18 @@ class Model(BaseModel):
     prompt_price: Optional[float] = Field(default=None, description="The prompt price of the model per 1M tokens.")
     completion_price: Optional[float] = Field(default=None, description="The completion price of the model per 1M tokens.")
     per_message_price: Optional[float] = Field(default=None, description="The price of the model per message.")
-    disable_cost_display_in_completion: Optional[bool] = Field(default=False, description="If true, disable showing the cost in the completion. Useful for reasoning models.")
-    no_system_prompt: Optional[bool] = Field(default=False, description="If true, remove the system prompt. Useful for o1 models.")
-    no_stream: Optional[bool] = Field(default=False, description="If true, do not stream the response. Useful for o1 models.")
-    fetch_usage_by_api: Optional[bool] = Field(
-        default=False, description="If true, fetch usage from the /generation endpoint, for example, OpenRouter. Only works with stream=true"
+    disable_cost_display_in_completion: Optional[bool] = Field(default=False, description="If true, disable showing the cost in the completion. Non-stream completions always don't show the cost.")
+    no_system_prompt: Optional[bool] = Field(default=False, description="If true, remove the system prompt.")
+    update_usage_via_openrouter_api: Optional[bool] = Field(
+        default=False, description="If true, fetch usage from the /generation endpoint, for OpenRouter models only."
     )
     fallback_compute_usage: Optional[bool] = Field(
-        default=True, description="If true, compute usage using tiktoken when no usage is found in the response."
+        default=True, description="If true, estimate usage using tiktoken when no usage is found in the response."
     )
     include_reasoning: Optional[bool] = Field(
-        default=False, description="If true, enable reasoning feature and add include_reasoning=true to the request payload."
+        default=False, description="If true, add include_reasoning=true to the request payload."
     )
-    extra_args: Optional[dict] = Field(default=None, description="Extra arguments to pass to the model. Will override the original values.")
+    extra_args: Optional[dict] = Field(default=None, description="Extra arguments to pass to the request payload. Will override the original values.")
 
 
 class Provider(BaseModel):
@@ -585,20 +584,18 @@ class Pipeline:
             is_estimate = False
             update_later = False
             estimated_usage = None
-            if usage is None or model.fetch_usage_by_api:
+            if usage is None or model.update_usage_via_openrouter_api:
                 estimated_usage = self.compute_usage_by_tiktoken(model, messages, user_message, reasoning_content + content)
                 is_estimate = usage is None
                 usage = usage or estimated_usage
 
             base_cost, actual_cost = self.compute_price(model, provider, usage)
 
-            # 创建数据库记录
             usage_log_id = self.add_usage_log(
                 user.id, model, usage, base_cost, actual_cost, content=user_message, is_stream=is_stream, is_title_generation=is_title_generation
             )
 
-            if model.fetch_usage_by_api and message_id:
-                # 启动后台任务获取实际使用量
+            if model.update_usage_via_openrouter_api and message_id:
                 update_later = True
 
                 thread = threading.Thread(target=self.update_usage_in_background, args=(message_id, usage_log_id, model, provider, user))
@@ -656,7 +653,7 @@ class Pipeline:
         message_id = response.get("id")
 
         estimated_usage = None
-        if usage is None or model.fetch_usage_by_api:
+        if usage is None or model.update_usage_via_openrouter_api:
             estimated_usage = self.compute_usage_by_tiktoken(model, messages, user_message, content)
             usage = usage or estimated_usage
 
@@ -665,14 +662,12 @@ class Pipeline:
             user.id, model, usage, base_cost, actual_cost, content=user_message, is_stream=is_stream, is_title_generation=is_title_generation
         )
 
-        if model.fetch_usage_by_api and message_id:
-            # 启动后台任务获取实际使用量
+        if model.update_usage_via_openrouter_api and message_id:
             thread = threading.Thread(target=self.update_usage_in_background, args=(message_id, usage_log_id, model, provider, user))
             thread.daemon = True
             thread.start()
 
         # non stream response should not show cost in completion
-
         # if model.show_cost_in_completion and display_usage_cost and not is_title_generation:
         #     message["content"] += self.generate_usage_cost_message(usage, base_cost, actual_cost, user, usage is None, model.fetch_usage_by_api)
 

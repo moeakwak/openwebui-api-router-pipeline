@@ -46,7 +46,7 @@ models:
     human_name: Claude-3.5-Sonnet (OpenRouter)
     prompt_price: 3
     completion_price: 15
-    fetch_usage_by_api: true
+    update_usage_via_openrouter_api: true
 
   - code: gemini-2.0-flash-thinking-exp-01-21
     provider: GoogleAI
@@ -107,7 +107,7 @@ models:
     completion_price: 7
     include_reasoning: true
     extra_args: { "temperature": 0.6 }
-    fetch_usage_by_api: true
+    update_usage_via_openrouter_api: true
     disable_cost_display_in_completion: true
     no_system_prompt: true
 
@@ -116,7 +116,7 @@ models:
     human_name: Deepseek R1 (OpenRouter, free)
     prompt_price: 0
     completion_price: 0
-    fetch_usage_by_api: true
+    update_usage_via_openrouter_api: true
     include_reasoning: true
     extra_args: { "temperature": 0.6 }
     no_system_prompt: true
