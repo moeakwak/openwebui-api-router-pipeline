@@ -2,7 +2,7 @@
 title: Omni Router Manifold Pipeline
 author: Moeakwak
 date: 2025-02-13
-version: 0.2.3
+version: 0.3.0
 license: MIT
 description: A pipeline for routing OpenAI models, track user usages, etc.
 requirements: tabulate
@@ -784,12 +784,13 @@ def get_admin_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     gstats_parser = subparsers.add_parser("gstats", help="Show global usage statistics")
     gstats_parser.add_argument("-p", "--period", choices=["d", "w", "m"], help="Period (d: daily, w: weekly, m: monthly)")
     gstats_parser.add_argument("-m", "--model", type=str, default=None, help="Filter by model")
+    gstats_parser.add_argument("-u", "--user", type=str, default=None, help="Filter by user id")
 
     grecent_parser = subparsers.add_parser("grecent", help="Show global recent usage logs")
     grecent_parser.add_argument("-c", "--count", type=int, default=50, help="Number of logs to show")
     grecent_parser.add_argument("-p", "--page", type=int, default=0, help="Page number")
     grecent_parser.add_argument("-m", "--model", type=str, default=None, help="Filter by model")
-    grecent_parser.add_argument("-u", "--user", type=str, default=None, help="Filter by user id")
+    grecent_parser.add_argument("-u", "--user_id", type=str, default=None, help="Filter by user id")
     grecent_parser.add_argument("-a", "--all", action="store_true", help="Show all logs (including title generation)")
 
     list_users_parser = subparsers.add_parser("users", help="List all users")
@@ -866,15 +867,23 @@ class ServiceBot:
         return self._get_model_stats(args.period, user.id)
 
     def gstats(self, args: argparse.Namespace, user: User) -> str:
-        return self._get_model_stats(args.period) + "\n\n" + self._get_user_stats(args.period, args.model)
+        assert user.role == "admin"
+        if args.user_id:
+            return self._get_model_stats(args.period, args.user_id)
+        elif args.model:
+            return self._get_user_stats(args.period, args.model)
+        else:
+            return self._get_model_stats(args.period) + "\n\n" + self._get_user_stats(args.period, args.model)
 
     def recent(self, args: argparse.Namespace, user: User) -> str:
         return self._get_recent_logs(args.count, args.page, user.id, show_title_generation=args.all, filter_auxiliary_model=not args.all)
 
     def grecent(self, args: argparse.Namespace, user: User) -> str:
-        return self._get_recent_logs(args.count, args.page, args.user, args.model, show_title_generation=args.all, filter_auxiliary_model=not args.all)
+        assert user.role == "admin"
+        return self._get_recent_logs(args.count, args.page, args.user_id, args.model, show_title_generation=args.all, filter_auxiliary_model=not args.all)
 
     def topup(self, args: argparse.Namespace, user: User) -> str:
+        assert user.role == "admin"
         with Session(self.pipeline.engine) as session:
             db_user = session.exec(select(User).where((User.id == args.user) | (User.email == args.user))).first()
             if not db_user:
@@ -885,6 +894,7 @@ class ServiceBot:
             return f"Successfully topped up {db_user.email}'s balance by {self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{args.amount:.2f}. New balance: {self.pipeline.valves.ACTUAL_COST_CURRENCY_UNIT}{db_user.balance:.2f}"
 
     def set_balance(self, args: argparse.Namespace, user: User) -> str:
+        assert user.role == "admin"
         with Session(self.pipeline.engine) as session:
             db_user = session.exec(select(User).where((User.id == args.user) | (User.email == args.user))).first()
             if not db_user:
@@ -900,6 +910,7 @@ class ServiceBot:
             price_ratio_map[provider.key] = provider.price_ratio
 
         headers = [
+            "Provider",
             "Model",
             f"Prompt (per 1M)",
             f"Completion (per 1M)",
@@ -907,7 +918,7 @@ class ServiceBot:
             "Ratio",
         ]
         if args.full:
-            headers.insert(1, "Slug")
+            headers.insert(2, "Slug")
         data = []
 
         for model_id, model in self.pipeline.models.items():
@@ -937,6 +948,7 @@ class ServiceBot:
             )
 
             item = [
+                model.provider,
                 model.human_name or model.code,
                 prompt_price_text,
                 completion_price_text,
@@ -944,7 +956,7 @@ class ServiceBot:
                 price_ratio_map[model.provider] or "-",
             ]
             if args.full:
-                item.insert(1, f"{self.pipeline.id}.{model_id}")
+                item.insert(2, f"{self.pipeline.id}.{model_id}")
 
             data.append(item)
 
