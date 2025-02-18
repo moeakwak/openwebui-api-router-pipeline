@@ -2,7 +2,7 @@
 title: Omni Router Manifold Pipeline
 author: Moeakwak
 date: 2025-02-13
-version: 0.3.0
+version: 0.3.1
 license: MIT
 description: A pipeline for routing OpenAI models, track user usages, etc.
 requirements: tabulate
@@ -40,7 +40,9 @@ class Model(BaseModel):
     prompt_price: Optional[float] = Field(default=None, description="The prompt price of the model per 1M tokens.")
     completion_price: Optional[float] = Field(default=None, description="The completion price of the model per 1M tokens.")
     per_message_price: Optional[float] = Field(default=None, description="The price of the model per message.")
-    disable_cost_display_in_completion: Optional[bool] = Field(default=False, description="If true, disable showing the cost in the completion. Non-stream completions always don't show the cost.")
+    disable_cost_display_in_completion: Optional[bool] = Field(
+        default=False, description="If true, disable showing the cost in the completion. Non-stream completions always don't show the cost."
+    )
     no_system_prompt: Optional[bool] = Field(default=False, description="If true, remove the system prompt.")
     update_usage_via_openrouter_api: Optional[bool] = Field(
         default=False, description="If true, fetch usage from the /generation endpoint, for OpenRouter models only."
@@ -48,9 +50,7 @@ class Model(BaseModel):
     fallback_compute_usage: Optional[bool] = Field(
         default=True, description="If true, estimate usage using tiktoken when no usage is found in the response."
     )
-    include_reasoning: Optional[bool] = Field(
-        default=False, description="If true, add include_reasoning=true to the request payload."
-    )
+    include_reasoning: Optional[bool] = Field(default=False, description="If true, add include_reasoning=true to the request payload.")
     extra_args: Optional[dict] = Field(default=None, description="Extra arguments to pass to the request payload. Will override the original values.")
 
 
@@ -110,6 +110,16 @@ def escape_model_code(code: str):
     return code.replace("/", "__").replace(":", "___")
 
 
+def mask_message_content(body_or_payload: dict):
+    if "messages" in body_or_payload:
+        for message in body_or_payload["messages"]:
+            if "content" in message:
+                message["content"] = message["content"][:50]
+                if len(message["content"]) > 50:
+                    message["content"] += "......"
+    return body_or_payload
+
+
 def print_log(message: str, model: Optional[Model] = None, user: Optional[User] = None):
     prefix = f"Router Pipeline | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     if model:
@@ -117,6 +127,7 @@ def print_log(message: str, model: Optional[Model] = None, user: Optional[User] 
     if user:
         prefix += f" ({user.name})"
     print(f"{prefix} | {message}")
+
 
 def print_and_raise(message: str):
     print(f"***** ERROR | {message}")
@@ -146,7 +157,6 @@ class Pipeline:
         NOT_STARTED = auto()  # Initial state
         IN_PROGRESS = auto()  # Currently processing reasoning content
         COMPLETED = auto()  # Finished reasoning, processing normal content
-    
 
     def print_debug(self, message: str):
         if self.valves.DEBUG_MODE:
@@ -325,7 +335,7 @@ class Pipeline:
 
     def pipe(self, user_message: str, model_id: str, messages: list[dict], body: dict) -> Union[str, Generator, Iterator]:
         user_info = body.pop("user")
-        self.print_debug(f"PRINT BODY: {body}")
+        self.print_debug(f"PRINT BODY: {mask_message_content(body)}")
 
         try:
             user = self.get_user_info(user_info)
@@ -374,8 +384,8 @@ class Pipeline:
                 del payload["chat_id"]
             if "title" in payload:
                 del payload["title"]
-            
-            self.print_debug(f"PAYLOAD: {payload}")
+
+            self.print_debug(f"PAYLOAD: {mask_message_content(payload)}")
 
             try:
                 r = requests.post(url=f"{provider.url}/chat/completions", json=payload, headers=headers, stream=True, timeout=30)  # 添加超时设置
@@ -602,6 +612,13 @@ class Pipeline:
                 thread.daemon = True
                 thread.start()
 
+            if not is_title_generation and actual_cost > 0.001:
+                print_log(
+                    f"STREAM USAGE: {usage}, base_cost: {base_cost}, actual_cost: {actual_cost}, is_estimate: {is_estimate}, update_later: {update_later}",
+                    model,
+                    user,
+                )
+
             if not model.disable_cost_display_in_completion and display_usage_cost and not is_title_generation:
                 if last_chunk:
                     new_chunk = last_chunk.copy()
@@ -653,6 +670,7 @@ class Pipeline:
         message_id = response.get("id")
 
         estimated_usage = None
+        update_later = False
         if usage is None or model.update_usage_via_openrouter_api:
             estimated_usage = self.compute_usage_by_tiktoken(model, messages, user_message, content)
             usage = usage or estimated_usage
@@ -662,11 +680,22 @@ class Pipeline:
             user.id, model, usage, base_cost, actual_cost, content=user_message, is_stream=is_stream, is_title_generation=is_title_generation
         )
 
-        if model.update_usage_via_openrouter_api and message_id:
-            thread = threading.Thread(target=self.update_usage_in_background, args=(message_id, usage_log_id, model, provider, user))
-            thread.daemon = True
-            thread.start()
+        if model.update_usage_via_openrouter_api:
+            if message_id:
+                thread = threading.Thread(target=self.update_usage_in_background, args=(message_id, usage_log_id, model, provider, user))
+                thread.daemon = True
+                thread.start()
+                update_later = True
+            else:
+                print_log("Warning: update_usage_via_openrouter_api - No message id found, cannot update usage", model, user)
 
+        is_estimate = estimated_usage is not None
+        if not is_title_generation and actual_cost > 0.001:
+            print_log(
+                f"NON-STREAM USAGE: {usage}, base_cost: {base_cost}, actual_cost: {actual_cost}, is_estimate: {is_estimate}, update_later: {update_later}",
+                model,
+                user,
+            )
         # non stream response should not show cost in completion
         # if model.show_cost_in_completion and display_usage_cost and not is_title_generation:
         #     message["content"] += self.generate_usage_cost_message(usage, base_cost, actual_cost, user, usage is None, model.fetch_usage_by_api)
@@ -880,7 +909,9 @@ class ServiceBot:
 
     def grecent(self, args: argparse.Namespace, user: User) -> str:
         assert user.role == "admin"
-        return self._get_recent_logs(args.count, args.page, args.user_id, args.model, show_title_generation=args.all, filter_auxiliary_model=not args.all)
+        return self._get_recent_logs(
+            args.count, args.page, args.user_id, args.model, show_title_generation=args.all, filter_auxiliary_model=not args.all
+        )
 
     def topup(self, args: argparse.Namespace, user: User) -> str:
         assert user.role == "admin"
