@@ -1,8 +1,8 @@
 """
 title: Omni Router Manifold Pipeline
 author: Moeakwak
-date: 2025-02-13
-version: 0.3.1
+date: 2025-02-19
+version: 0.3.3
 license: MIT
 description: A pipeline for routing OpenAI models, track user usages, etc.
 requirements: tabulate
@@ -29,6 +29,7 @@ from enum import Enum, auto
 import time
 import threading
 from http import HTTPStatus
+import copy
 
 # Schemas
 
@@ -110,14 +111,17 @@ def escape_model_code(code: str):
     return code.replace("/", "__").replace(":", "___")
 
 
-def mask_message_content(body_or_payload: dict):
-    if "messages" in body_or_payload:
-        for message in body_or_payload["messages"]:
+def mask_message_content(body_or_payload: dict, shorten_log: bool = False):
+    result = copy.deepcopy(body_or_payload)
+    if "messages" in result:
+        for message in result["messages"]:
             if "content" in message:
-                message["content"] = message["content"][:50]
-                if len(message["content"]) > 50:
-                    message["content"] += "......"
-    return body_or_payload
+                if shorten_log:
+                    message["content"] = message["content"][:50]
+                    if len(message["content"]) > 50:
+                        message["content"] += "......"
+    result = json.dumps(result, indent=2, ensure_ascii=False)
+    return result
 
 
 def print_log(message: str, model: Optional[Model] = None, user: Optional[User] = None):
@@ -149,7 +153,9 @@ class Pipeline:
         )
         TIMEZONE: str = Field(default="UTC", description="The timezone of the server.")
         AUXILIARY_MODEL_CODE: str = Field(default="gpt-4o-mini", description="The model to use for title generation.")
-        DEBUG_MODE: bool = Field(default=False, description="If true, enable debug mode.")
+        REQUEST_TIMEOUT: int = Field(default=300, description="The timeout of the request connection in seconds.")
+        DEBUG_MODE: bool = Field(default=True, description="If true, show debug logs.")
+        DEBUG_SHORTEN_LOG: bool = Field(default=False, description="If true, shorten the log.")
 
     class ReasoningState(Enum):
         """Enum for tracking the state of reasoning in stream response"""
@@ -180,9 +186,11 @@ class Pipeline:
                 "DEFAULT_USER_BALANCE": float(os.getenv("DEFAULT_USER_BALANCE", 10)),
                 "BASE_COST_CURRENCY_UNIT": os.getenv("BASE_COST_CURRENCY_UNIT", "$"),
                 "ACTUAL_COST_CURRENCY_UNIT": os.getenv("ACTUAL_COST_CURRENCY_UNIT", "$"),
+                "REQUEST_TIMEOUT": int(os.getenv("REQUEST_TIMEOUT", 300)),
                 "TIMEZONE": os.getenv("TIMEZONE", "UTC"),
                 "AUXILIARY_MODEL_CODE": os.getenv("AUXILIARY_MODEL_CODE", "gpt-4o-mini"),
-                "DEBUG_MODE": True if os.getenv("DEBUG_MODE", "false").lower() == "true" else False,
+                "DEBUG_MODE": False if os.getenv("DEBUG_MODE", "false").lower() == "false" else True,
+                "DEBUG_SHORTEN_LOG": False if os.getenv("DEBUG_SHORTEN_LOG", "true").lower() == "false" else True,
             }
         )
         self.config = self.load_config()
@@ -335,7 +343,7 @@ class Pipeline:
 
     def pipe(self, user_message: str, model_id: str, messages: list[dict], body: dict) -> Union[str, Generator, Iterator]:
         user_info = body.pop("user")
-        self.print_debug(f"PRINT BODY: {mask_message_content(body)}")
+        self.print_debug(f"PRINT BODY: {mask_message_content(body, self.valves.DEBUG_SHORTEN_LOG)}")
 
         try:
             user = self.get_user_info(user_info)
@@ -385,10 +393,10 @@ class Pipeline:
             if "title" in payload:
                 del payload["title"]
 
-            self.print_debug(f"PAYLOAD: {mask_message_content(payload)}")
+            self.print_debug(f"PAYLOAD: {mask_message_content(payload, self.valves.DEBUG_SHORTEN_LOG)}")
 
             try:
-                r = requests.post(url=f"{provider.url}/chat/completions", json=payload, headers=headers, stream=True, timeout=30)  # 添加超时设置
+                r = requests.post(url=f"{provider.url}/chat/completions", json=payload, headers=headers, stream=True, timeout=self.valves.REQUEST_TIMEOUT)
 
                 # 检查响应状态码
                 if r.status_code != 200:
@@ -813,7 +821,7 @@ def get_admin_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argu
     gstats_parser = subparsers.add_parser("gstats", help="Show global usage statistics")
     gstats_parser.add_argument("-p", "--period", choices=["d", "w", "m"], help="Period (d: daily, w: weekly, m: monthly)")
     gstats_parser.add_argument("-m", "--model", type=str, default=None, help="Filter by model")
-    gstats_parser.add_argument("-u", "--user", type=str, default=None, help="Filter by user id")
+    gstats_parser.add_argument("-u", "--user_id", type=str, default=None, help="Filter by user id")
 
     grecent_parser = subparsers.add_parser("grecent", help="Show global recent usage logs")
     grecent_parser.add_argument("-c", "--count", type=int, default=50, help="Number of logs to show")
@@ -887,7 +895,8 @@ class ServiceBot:
         try:
             result = self.commands[args.command](args, user)
         except Exception as e:
-            return "An error occurred while executing the command.\n\n" + f"```\n{clean_usage(added_parsers_map[args.command].format_usage())}\n```"
+            print_log(f"Error executing command: {e}")
+            return f"An error occurred while executing the command: {e}\n\n" + f"```\n{clean_usage(added_parsers_map[args.command].format_usage())}\n```"
 
         return result
 
