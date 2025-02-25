@@ -37,6 +37,7 @@ import copy
 class Model(BaseModel):
     provider: str
     code: str
+    extra_identifier: Optional[str] = Field(default=None, description="Extra identifier for the model. Useful for creating multiple instances of the same model.")
     human_name: Optional[str] = Field(default=None)
     prompt_price: Optional[float] = Field(default=None, description="The prompt price of the model per 1M tokens.")
     completion_price: Optional[float] = Field(default=None, description="The completion price of the model per 1M tokens.")
@@ -253,7 +254,10 @@ class Pipeline:
                 print_and_raise(f"Model {model.code} must have both prompt price and completion price set, or neither")
             elif not has_prompt_price and model.per_message_price is None:
                 print_and_raise(f"Model {model.code} must have either (prompt price + completion price) or per message price set")
-            models[f"{model.provider}_{escape_model_code(model.code)}"] = model
+            model_id = f"{model.provider}_{escape_model_code(model.code)}"
+            if model.extra_identifier:
+                model_id += f"_{model.extra_identifier}"
+            models[model_id] = model
 
         return models
 
